@@ -327,7 +327,16 @@ impl PlatformDownloader for YouTubeDownloader {
 }
 
 impl PlatformDownloader for FacebookDownloader {}
-impl PlatformDownloader for InstagramDownloader {}
+impl PlatformDownloader for InstagramDownloader {
+    fn download(&self, url: &str, _format_id: &str) -> Result<(), Error> {
+        Command::new("yt-dlp")
+            .args(["-f", "best", "--cookies", "instagram-cookies.txt", url])
+            .output()
+            .map_err(|error| Error::YtDlpExecutionFailed(error.to_string()))?;
+
+        Ok(())
+    }
+}
 impl PlatformDownloader for XDownloader {}
 impl PlatformDownloader for TikTokDownloader {}
 
