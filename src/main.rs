@@ -2,6 +2,7 @@ use axum::{
     Router,
     extract::{Json, Query},
     http::StatusCode,
+    response::Html,
     routing::get,
 };
 use serde::{Deserialize, Serialize};
@@ -332,13 +333,203 @@ async fn run_server(address: Option<String>) -> Result<(), Error> {
 
 fn api_router() -> Router {
     Router::new()
+        .route("/ui", get(ui_handler))
         .route("/formats", get(list_formats_handler))
         .route("/download", get(download_handler))
+}
+
+async fn ui_handler() -> Html<&'static str> {
+    Html(
+        r#"<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Downloader</title>
+  <style>
+    :root {
+      color-scheme: light dark;
+      font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      background: #f3f6fb;
+      color: #172033;
+    }
+
+    body {
+      box-sizing: border-box;
+      display: grid;
+      min-height: 100vh;
+      margin: 0;
+      padding: 1rem;
+      place-items: center;
+    }
+
+    main {
+      box-sizing: border-box;
+      width: min(100%, 36rem);
+      padding: clamp(1.25rem, 5vw, 2.5rem);
+      border: 1px solid #dce3ef;
+      border-radius: 1rem;
+      background: #ffffff;
+      box-shadow: 0 1rem 2.5rem rgb(36 55 85 / 12%);
+    }
+
+    h1 {
+      margin-top: 0;
+      font-size: clamp(1.75rem, 7vw, 2.5rem);
+    }
+
+    form {
+      display: grid;
+      gap: 0.65rem;
+    }
+
+    input,
+    form button,
+    #formats button {
+      box-sizing: border-box;
+      width: 100%;
+      min-height: 3rem;
+      border: 1px solid #b9c7dc;
+      border-radius: 0.6rem;
+      padding: 0.75rem 1rem;
+      font: inherit;
+    }
+
+    form button,
+    #formats button {
+      cursor: pointer;
+      font-weight: 600;
+      transition: transform 120ms ease, box-shadow 120ms ease;
+    }
+
+    form button {
+      border-color: #315fca;
+      background: #315fca;
+      color: white;
+    }
+
+    #formats {
+      display: grid;
+      gap: 0.75rem;
+      margin-top: 1rem;
+    }
+
+    #formats button {
+      display: block;
+      border-color: #b8c8e4;
+      background: #edf3ff;
+      color: #1c3974;
+      font-size: 1.05rem;
+    }
+
+    form button:hover,
+    #formats button:hover {
+      transform: translateY(-1px);
+      box-shadow: 0 0.35rem 0.8rem rgb(36 55 85 / 18%);
+    }
+
+    #message {
+      min-height: 1.5rem;
+      color: #43516a;
+      font-weight: 600;
+    }
+
+    @media (prefers-color-scheme: dark) {
+      :root {
+        background: #111827;
+        color: #e8edf7;
+      }
+
+      main {
+        border-color: #334155;
+        background: #1e293b;
+      }
+
+      input {
+        border-color: #52647f;
+        background: #172033;
+        color: #e8edf7;
+      }
+
+      #formats button {
+        border-color: #526da5;
+        background: #263b68;
+        color: #e8edf7;
+      }
+
+      #message {
+        color: #c1cee3;
+      }
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>Downloader</h1>
+    <form id="formats-form">
+      <label for="url">URL</label>
+      <input id="url" name="url" type="url" required>
+      <button type="submit">List formats</button>
+    </form>
+    <p id="message"></p>
+    <div id="formats"></div>
+  </main>
+  <script>
+    const form = document.getElementById("formats-form");
+    const urlInput = document.getElementById("url");
+    const formats = document.getElementById("formats");
+    const message = document.getElementById("message");
+
+    form.addEventListener("submit", async (event) => {
+      event.preventDefault();
+      formats.replaceChildren();
+      message.textContent = "Loading formats...";
+
+      try {
+        const url = urlInput.value;
+        const response = await fetch(`/formats?url=${encodeURIComponent(url)}`);
+        if (!response.ok) throw new Error(await response.text());
+
+        for (const format of await response.json()) {
+          const button = document.createElement("button");
+          button.type = "button";
+          const label = format.height === undefined && format.format_id === "best"
+            ? "download"
+            : `${format.height}p${format.filesize === undefined
+              ? ""
+              : ` - ${(format.filesize / 1_000_000).toFixed(1)} MB`}`;
+          button.textContent = label;
+          button.addEventListener("click", async () => {
+            message.textContent = "Starting download...";
+            try {
+              const download = await fetch(
+                `/download?url=${encodeURIComponent(url)}&format_id=${encodeURIComponent(format.format_id)}`
+              );
+              if (!download.ok) throw new Error(await download.text());
+
+              formats.replaceChildren();
+              message.textContent = "Download complete";
+            } catch (error) {
+              message.textContent = `Download failed: ${error}`;
+            }
+          });
+          formats.append(button);
+        }
+        message.textContent = "Choose a format:";
+      } catch (error) {
+        message.textContent = `Could not list formats: ${error}`;
+      }
+    });
+  </script>
+</body>
+</html>"#,
+    )
 }
 
 async fn list_formats_handler(
     Query(request): Query<FormatsRequest>,
 ) -> Result<Json<Vec<Format>>, (StatusCode, String)> {
+    println!("Received formats request for URL: {}", request.url);
     list_formats(&request.url)
         .await
         .map(Json)
@@ -348,6 +539,10 @@ async fn list_formats_handler(
 async fn download_handler(
     Query(request): Query<DownloadRequest>,
 ) -> Result<StatusCode, (StatusCode, String)> {
+    println!(
+        "Received download request for URL: {} with format: {}",
+        request.url, request.format_id
+    );
     download_video(&request.url, &request.format_id)
         .await
         .map(|()| StatusCode::NO_CONTENT)
@@ -421,11 +616,15 @@ async fn download_video(url: &str, format_id: &str) -> Result<(), Error> {
 static LIVE_TEST_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
 #[cfg(test)]
+fn get_env_variable(name: &str) -> String {
+    dotenvy::dotenv().ok();
+    std::env::var(name).unwrap_or_else(|_| panic!("{name} must be set in .env"))
+}
+
+#[cfg(test)]
 mod api_tests {
     use super::*;
     use std::path::Path;
-
-    const YOUTUBE_URL: &str = "https://youtu.be/foO1QakhjZE?si=tRel8JwJ_kmZJoul";
 
     fn cleanup_download() {
         let path = Path::new(DOWNLOADS_DIRECTORY).join("foO1QakhjZE.mp4");
@@ -435,7 +634,7 @@ mod api_tests {
     #[tokio::test]
     async fn formats_endpoint_returns_default_format_for_supported_fallback_platform() {
         let response = list_formats_handler(Query(FormatsRequest {
-            url: "https://www.facebook.com/video".to_owned(),
+            url: get_env_variable("FACEBOOK_TEST_URL"),
         }))
         .await
         .unwrap()
@@ -464,8 +663,9 @@ mod api_tests {
             .unwrap();
         cleanup_download();
 
+        let youtube_url = get_env_variable("YOUTUBE_TEST_URL");
         let formats = list_formats_handler(Query(FormatsRequest {
-            url: YOUTUBE_URL.to_owned(),
+            url: youtube_url.clone(),
         }))
         .await
         .unwrap()
@@ -475,7 +675,7 @@ mod api_tests {
             .expect("YouTube formats should not be empty");
 
         let response = download_handler(Query(DownloadRequest {
-            url: YOUTUBE_URL.to_owned(),
+            url: youtube_url,
             format_id: lowest_format.format_id.clone(),
         }))
         .await
@@ -494,14 +694,26 @@ mod api_tests {
     fn router_exposes_api_routes() {
         let _router = api_router();
     }
+
+    #[tokio::test]
+    async fn ui_page_loads_formats_and_starts_downloads() {
+        let page = ui_handler().await.0;
+
+        assert!(page.contains("/formats?url="));
+        assert!(page.contains("format.format_id"));
+        assert!(page.contains("/download?url="));
+        assert!(page.contains("format_id="));
+        assert!(page.contains("Download complete"));
+        assert!(!page.contains("form.reset()"));
+        assert!(page.contains("formats.replaceChildren()"));
+        assert!(page.contains("@media (prefers-color-scheme: dark)"));
+    }
 }
 
 #[cfg(test)]
 mod cli_tests {
     use super::*;
     use std::path::Path;
-
-    const YOUTUBE_URL: &str = "https://youtu.be/foO1QakhjZE?si=tRel8JwJ_kmZJoul";
 
     fn cleanup_download() {
         let path = Path::new(DOWNLOADS_DIRECTORY).join("foO1QakhjZE.mp4");
@@ -547,12 +759,13 @@ mod cli_tests {
             .unwrap();
         cleanup_download();
 
-        let formats = list_formats(YOUTUBE_URL).await.unwrap();
+        let youtube_url = get_env_variable("YOUTUBE_TEST_URL");
+        let formats = list_formats(&youtube_url).await.unwrap();
         let lowest_format = formats
             .first()
             .expect("YouTube formats should not be empty");
 
-        download_video(YOUTUBE_URL, &lowest_format.format_id)
+        download_video(&youtube_url, &lowest_format.format_id)
             .await
             .unwrap();
 
@@ -572,7 +785,7 @@ mod downloader_unit_tests {
     #[test]
     fn default_downloader_returns_only_best_format_without_metadata() {
         let formats = FacebookDownloader
-            .list_formats("https://www.facebook.com/video")
+            .list_formats(&get_env_variable("FACEBOOK_TEST_URL"))
             .unwrap();
 
         assert_eq!(formats.len(), 1);
@@ -591,7 +804,7 @@ mod downloader_unit_tests {
         ] {
             assert_eq!(
                 downloader
-                    .list_formats("https://example.com/video")
+                    .list_formats(&get_env_variable("EXAMPLE_TEST_URL"))
                     .unwrap()[0]
                     .format_id,
                 "best"

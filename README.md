@@ -14,11 +14,28 @@ The existing interactive CLI is the default:
 cargo run
 ```
 
+Live tests read their URLs from a local `.env` file. Copy `.env.example` to
+`.env` and fill in the values before running the tests:
+
+```sh
+cp .env.example .env
+cargo test
+```
+
+The `.env` file is ignored by Git so these values stay local.
+
 To start the Axum JSON API, use `server` and optionally provide a bind address:
 
 ```sh
 cargo run -- server
 cargo run -- server 0.0.0.0:3000
+```
+
+Open the browser interface at `/ui` to enter a URL, list its formats, and
+start a download by selecting a format:
+
+```text
+http://localhost:3000/ui
 ```
 
 List available formats with `GET /formats`:
