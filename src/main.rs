@@ -167,28 +167,32 @@ trait PlatformDownloader {
 struct YouTubeDownloader;
 
 impl YouTubeDownloader {
-    const COOKIES_FILE: &'static str =
-        concat!(env!("CARGO_MANIFEST_DIR"), "/cookies/youtube-cookies.txt");
+    const COOKIES_FILE_ENV_KEY: &'static str = "YOUTUBE_COOKIES_FILE";
 }
 
 struct FacebookDownloader;
 struct InstagramDownloader;
 
 impl InstagramDownloader {
-    const COOKIES_FILE: &'static str =
-        concat!(env!("CARGO_MANIFEST_DIR"), "/cookies/instagram-cookies.txt");
+    const COOKIES_FILE_ENV_KEY: &'static str = "INSTAGRAM_COOKIES_FILE";
 }
 
 struct XDownloader;
 struct TikTokDownloader;
 
+fn get_cookies_file_path(name: &str) -> Result<String, Error> {
+    dotenvy::dotenv().ok();
+    std::env::var(name).map_err(|_| Error::InvalidInput(format!("{name} must be set in .env")))
+}
+
 impl PlatformDownloader for YouTubeDownloader {
     fn list_formats(&self, url: &str) -> Result<Vec<Format>, Error> {
+        let cookies_file_path = get_cookies_file_path(Self::COOKIES_FILE_ENV_KEY)?;
         let video_details = Command::new("yt-dlp")
             .arg("--dump-single-json")
             .arg("--skip-download")
             .arg("--cookies")
-            .arg(Self::COOKIES_FILE)
+            .arg(cookies_file_path)
             .arg(url)
             .stdout(Stdio::piped())
             .spawn()
@@ -220,6 +224,7 @@ impl PlatformDownloader for YouTubeDownloader {
         }
 
         std::fs::create_dir_all(DOWNLOADS_DIRECTORY).map_err(Error::IO)?;
+        let cookies_file_path = get_cookies_file_path(Self::COOKIES_FILE_ENV_KEY)?;
 
         Command::new("yt-dlp")
             .args([
@@ -232,7 +237,7 @@ impl PlatformDownloader for YouTubeDownloader {
                 "--postprocessor-args",
                 "Merger+ffmpeg:-c:v libx264 -c:a aac -pix_fmt yuv420p -movflags +faststart",
                 "--cookies",
-                Self::COOKIES_FILE,
+                &cookies_file_path,
                 "-o",
                 DOWNLOAD_FILE,
                 url,
@@ -257,13 +262,14 @@ impl PlatformDownloader for FacebookDownloader {}
 impl PlatformDownloader for InstagramDownloader {
     fn download(&self, url: &str, _format_id: &str) -> Result<(), Error> {
         std::fs::create_dir_all(DOWNLOADS_DIRECTORY).map_err(Error::IO)?;
+        let cookies_file_path = get_cookies_file_path(Self::COOKIES_FILE_ENV_KEY)?;
 
         Command::new("yt-dlp")
             .args([
                 "-f",
                 "best",
                 "--cookies",
-                Self::COOKIES_FILE,
+                &cookies_file_path,
                 "-o",
                 DOWNLOAD_FILE,
                 url,

@@ -23,6 +23,8 @@ cargo test
 ```
 
 The `.env` file is ignored by Git so these values stay local.
+Set `YOUTUBE_COOKIES_FILE` and `INSTAGRAM_COOKIES_FILE` in `.env` to the
+cookie-file paths used by the corresponding downloaders.
 
 To start the Axum JSON API, use `server` and optionally provide a bind address:
 
