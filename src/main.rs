@@ -1,5 +1,11 @@
-use std::collections::{ HashSet};
-use serde::Deserialize;
+use std::collections::{HashSet};
+use axum::{
+    extract::{Json, Query},
+    http::StatusCode,
+    routing::get,
+    Router,
+};
+use serde::{Deserialize, Serialize};
 use std::process::{Command, Stdio};
 use std::io::{self, Write};
 use url::Url;
@@ -16,27 +22,33 @@ enum Error {
     UnsupportedPlatform(String),
 }
 
-enum VideoResolution {
-    P144,
-    P240,
-    P360,
-    P480,
-    P720,
-    P1080,
-    P1440,
-    P2160,
-    P4320,
-}
-
-#[derive(Deserialize, Debug)]
+#[derive(Deserialize, Serialize, Debug)]
 struct Format {
     format_id: String,
+    #[serde(skip_serializing_if = "is_zero")]
     height: u16,
     #[serde(skip_serializing)]
     ext: String,
     #[serde(skip_serializing)]
     vcodec: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
     filesize: Option<u64>,
+}
+
+fn is_zero(value: &u16) -> bool {
+    *value == 0
+}
+
+impl Format {
+    fn best() -> Self {
+        Self {
+            format_id: "best".to_owned(),
+            height: 0,
+            ext: String::new(),
+            vcodec: String::new(),
+            filesize: None,
+        }
+    }
 }
 
 #[derive(Default, Debug)]
@@ -101,31 +113,45 @@ fn filter_non_null_formats(selected_format_options: SelectedFormatOptions) -> Ve
         .collect()
 }
 
-struct DownloadFormat {
-    resolution: VideoResolution,
-}
-
-struct RequestBody {
+#[derive(Deserialize, Debug)]
+struct FormatsRequest {
     url: String,
 }
 
-trait DownloaderClient {
-    fn download();
-
-    fn list_formats();
+#[derive(Deserialize, Debug)]
+struct DownloadRequest {
+    url: String,
+    format_id: String,
 }
+
+trait PlatformDownloader {
+    fn list_formats(&self, _url: &str) -> Result<Vec<Format>, Error> {
+        Ok(vec![Format::best()])
+    }
+
+    fn download(&self, url: &str, _format_id: &str) -> Result<(), Error> {
+        Command::new("yt-dlp")
+            .args(["-f", "best", url])
+            .output()
+            .map_err(|error| Error::YtDlpExecutionFailed(error.to_string()))?;
+
+        Ok(())
+    }
+}
+
+struct YouTubeDownloader;
+struct FacebookDownloader;
+struct InstagramDownloader;
+struct XDownloader;
+struct TikTokDownloader;
 
 #[tokio::main]
 async fn main() -> Result<(), Error> {
-    let url = prompt("URL: ")?;
-
-    match get_platform_from_url(&url) {
-        Ok(platform) => match platform {
-            Platform::Unsupported(host) => return Err(Error::UnsupportedPlatform(host)),
-            _ => {}
-        }
-        Err(err) => return Err(err)
+    if std::env::args().nth(1).as_deref() == Some("server") {
+        return run_server(std::env::args().nth(2)).await;
     }
+
+    let url = prompt("URL: ")?;
 
     let formats = list_formats(&url).await?;
 
@@ -133,7 +159,11 @@ async fn main() -> Result<(), Error> {
         println!(
             "{}. {}p - {}",
             index + 1,
-            format.height,
+            if format.height == 0 {
+                "best".to_owned()
+            } else {
+                format.height.to_string()
+            },
             format.filesize
                 .map(|size| format!("{} MB", size / 1_000_000))
                 .unwrap_or_else(|| "unknown size".into())
@@ -154,6 +184,43 @@ async fn main() -> Result<(), Error> {
     println!("Download complete!");
 
     Ok(())
+}
+
+async fn run_server(address: Option<String>) -> Result<(), Error> {
+    let address = address.unwrap_or_else(|| "0.0.0.0:3000".to_owned());
+    let listener = tokio::net::TcpListener::bind(&address)
+        .await
+        .map_err(Error::IO)?;
+    let app = Router::new()
+        .route("/formats", get(list_formats_handler))
+        .route("/download", get(download_handler));
+
+    println!("Axum server listening on http://{address}");
+    axum::serve(listener, app)
+        .await
+        .map_err(|error| Error::IO(io::Error::other(error)))
+}
+
+async fn list_formats_handler(
+    Query(request): Query<FormatsRequest>,
+) -> Result<Json<Vec<Format>>, (StatusCode, String)> {
+    list_formats(&request.url)
+        .await
+        .map(Json)
+        .map_err(api_error)
+}
+
+async fn download_handler(
+    Query(request): Query<DownloadRequest>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    download_video(&request.url, &request.format_id)
+        .await
+        .map(|()| StatusCode::NO_CONTENT)
+        .map_err(api_error)
+}
+
+fn api_error(error: Error) -> (StatusCode, String) {
+    (StatusCode::BAD_REQUEST, format!("{error:?}"))
 }
 
 fn prompt(message: &str) -> Result<String, Error> {
@@ -189,53 +256,96 @@ fn get_platform_from_url(url: &str) -> Result<Platform, Error> {
     }
 }
 
+fn downloader_for_url(url: &str) -> Result<Box<dyn PlatformDownloader>, Error> {
+    match get_platform_from_url(url)? {
+        Platform::YouTube => Ok(Box::new(YouTubeDownloader)),
+        Platform::Facebook => Ok(Box::new(FacebookDownloader)),
+        Platform::Instagram => Ok(Box::new(InstagramDownloader)),
+        Platform::X => Ok(Box::new(XDownloader)),
+        Platform::TikTok => Ok(Box::new(TikTokDownloader)),
+        Platform::Unsupported(host) => Err(Error::UnsupportedPlatform(host)),
+    }
+}
+
 async fn list_formats(url: &str) -> Result<Vec<Format>, Error> {
-    let video_details = Command::new("yt-dlp")
-        .arg("--dump-single-json")
-        .arg("--skip-download")
-        .arg("--cookies")
-        .arg("youtube-cookies.txt")
-        .arg(url)
-        .stdout(Stdio::piped())
-        .spawn()
-        .map_err(|error| Error::YtDlpExecutionFailed(error.to_string()))?;
-
-    let formats_bytes = Command::new("jq")
-        .arg(r#"[.formats[] | select(.vcodec != "none" and .height != null) | {format_id, height, ext, vcodec, filesize}]"#)
-        .stdin(video_details.stdout.unwrap())
-        .output()
-        .map_err(|error| Error::JqExecutionFailed(error.to_string()))?;
-
-    let formats: Vec<Format> = serde_json::from_slice(&formats_bytes.stdout)
-        .map_err(|error| Error::FormatDeserializationFailed(error.to_string()))?;
-
-    let selected_format_options = select_formats(formats);
-
-    Ok(filter_non_null_formats(selected_format_options))
+    downloader_for_url(url)?.list_formats(url)
 }
 
 async fn download_video(url: &str, format_id: &str) -> Result<(), Error> {
-    let formats = list_formats(&url).await?;
-    let format_ids_set: HashSet<String> = formats.into_iter().map(|format| format.format_id).collect();
+    downloader_for_url(url)?.download(url, format_id)
+}
 
-    if !format_ids_set.contains(format_id) {
-        return Err(Error::InvalidInput(format!("Format ID not found: {}", format_id)));
+impl PlatformDownloader for YouTubeDownloader {
+    fn list_formats(&self, url: &str) -> Result<Vec<Format>, Error> {
+        let video_details = Command::new("yt-dlp")
+            .arg("--dump-single-json")
+            .arg("--skip-download")
+            .arg("--cookies")
+            .arg("youtube-cookies.txt")
+            .arg(url)
+            .stdout(Stdio::piped())
+            .spawn()
+            .map_err(|error| Error::YtDlpExecutionFailed(error.to_string()))?;
+
+        let formats_bytes = Command::new("jq")
+            .arg(r#"[.formats[] | select(.vcodec != "none" and .height != null) | {format_id, height, ext, vcodec, filesize}]"#)
+            .stdin(video_details.stdout.unwrap())
+            .output()
+            .map_err(|error| Error::JqExecutionFailed(error.to_string()))?;
+
+        let formats: Vec<Format> = serde_json::from_slice(&formats_bytes.stdout)
+            .map_err(|error| Error::FormatDeserializationFailed(error.to_string()))?;
+
+        let selected_format_options = select_formats(formats);
+
+        Ok(filter_non_null_formats(selected_format_options))
     }
 
-    Command::new("yt-dlp")
-        .args([
-            "-f",
-            &format!("{}+ba", format_id),
-            "--merge-output-format",
-            "mp4",
-            "--cookies",
-            "youtube-cookies.txt",
-            url,
-        ])
-        .output()
-        .map_err(|error| Error::YtDlpExecutionFailed(error.to_string()))?;
+    fn download(&self, url: &str, format_id: &str) -> Result<(), Error> {
+        let formats = self.list_formats(url)?;
+        let format_ids_set: HashSet<String> = formats.into_iter().map(|format| format.format_id).collect();
 
-    Ok(())
+        if !format_ids_set.contains(format_id) {
+            return Err(Error::InvalidInput(format!("Format ID not found: {format_id}")));
+        }
+
+        Command::new("yt-dlp")
+            .args([
+                "-f",
+                &format!("{format_id}+ba"),
+                "--merge-output-format",
+                "mp4",
+                "--cookies",
+                "youtube-cookies.txt",
+                url,
+            ])
+            .output()
+            .map_err(|error| Error::YtDlpExecutionFailed(error.to_string()))?;
+
+        Ok(())
+    }
+}
+
+impl PlatformDownloader for FacebookDownloader {}
+impl PlatformDownloader for InstagramDownloader {}
+impl PlatformDownloader for XDownloader {}
+impl PlatformDownloader for TikTokDownloader {}
+
+#[test]
+fn default_platform_returns_best_format_without_metadata() {
+    let formats = InstagramDownloader.list_formats("https://www.instagram.com/reel/Db3jbUyimmk/?stkn=M3VoNmZxaWxrYmt3").unwrap();
+
+    assert_eq!(formats.len(), 1);
+    assert_eq!(formats[0].format_id, "best");
+    assert_eq!(serde_json::to_value(&formats[0]).unwrap(), serde_json::json!({
+        "format_id": "best"
+    }));
+}
+
+#[tokio::test]
+async fn instagram_downloader_saves_video() {
+    let url = "https://www.instagram.com/reel/Db3jbUyimmk/?stkn=M3VoNmZxaWxrYmt3";
+    download_video(url, "401").await.unwrap();
 }
 
 #[tokio::test]
