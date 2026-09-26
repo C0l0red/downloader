@@ -1,8 +1,9 @@
 use axum::{
     Router,
+    body::Body,
     extract::{Json, Query},
     http::StatusCode,
-    response::Html,
+    response::{Html, Response},
     routing::get,
 };
 use serde::{Deserialize, Serialize};
@@ -140,6 +141,8 @@ struct FormatsRequest {
 struct DownloadRequest {
     url: String,
     format_id: String,
+    #[serde(default)]
+    keep_on_server: bool,
 }
 
 // Platform downloaders
@@ -224,6 +227,10 @@ impl PlatformDownloader for YouTubeDownloader {
                 &format!("{format_id}+ba"),
                 "--merge-output-format",
                 "mp4",
+                "--recode-video",
+                "mp4",
+                "--postprocessor-args",
+                "Merger+ffmpeg:-c:v libx264 -c:a aac -pix_fmt yuv420p -movflags +faststart",
                 "--cookies",
                 Self::COOKIES_FILE,
                 "-o",
@@ -507,6 +514,15 @@ async fn ui_handler() -> Html<&'static str> {
               );
               if (!download.ok) throw new Error(await download.text());
 
+              const blob = await download.blob();
+              const link = document.createElement("a");
+              link.href = URL.createObjectURL(blob);
+              const disposition = download.headers.get("Content-Disposition");
+              link.download = disposition?.match(/filename="([^"]+)"/)?.[1]
+                ?? `${format.format_id}.mp4`;
+              link.click();
+              URL.revokeObjectURL(link.href);
+
               formats.replaceChildren();
               message.textContent = "Download complete";
             } catch (error) {
@@ -538,15 +554,36 @@ async fn list_formats_handler(
 
 async fn download_handler(
     Query(request): Query<DownloadRequest>,
-) -> Result<StatusCode, (StatusCode, String)> {
+) -> Result<Response<Body>, (StatusCode, String)> {
     println!(
-        "Received download request for URL: {} with format: {}",
-        request.url, request.format_id
+        "Received download request for URL: {} with format: {} (keep_on_server: {})",
+        request.url, request.format_id, request.keep_on_server
     );
-    download_video(&request.url, &request.format_id)
-        .await
-        .map(|()| StatusCode::NO_CONTENT)
-        .map_err(api_error)
+    if request.keep_on_server {
+        download_video(&request.url, &request.format_id)
+            .await
+            .map(|()| {
+                Response::builder()
+                    .status(StatusCode::NO_CONTENT)
+                    .body(Body::empty())
+                    .unwrap()
+            })
+            .map_err(api_error)
+    } else {
+        download_for_client(&request.url, &request.format_id)
+            .await
+            .map(|(body, filename)| {
+                Response::builder()
+                    .header("content-type", "video/mp4")
+                    .header(
+                        "content-disposition",
+                        format!("attachment; filename=\"{filename}\""),
+                    )
+                    .body(body)
+                    .unwrap()
+            })
+            .map_err(api_error)
+    }
 }
 
 fn api_error(error: Error) -> (StatusCode, String) {
@@ -610,6 +647,34 @@ async fn list_formats(url: &str) -> Result<Vec<Format>, Error> {
 
 async fn download_video(url: &str, format_id: &str) -> Result<(), Error> {
     downloader_for_url(url)?.download(url, format_id)
+}
+
+async fn download_for_client(url: &str, format_id: &str) -> Result<(Body, String), Error> {
+    download_video(url, format_id).await?;
+
+    let path = std::fs::read_dir(DOWNLOADS_DIRECTORY)
+        .map_err(Error::IO)?
+        .filter_map(Result::ok)
+        .filter(|entry| entry.path().is_file())
+        .max_by_key(|entry| {
+            entry
+                .metadata()
+                .and_then(|metadata| metadata.modified())
+                .ok()
+        })
+        .map(|entry| entry.path())
+        .ok_or_else(|| {
+            Error::YtDlpExecutionFailed("yt-dlp did not produce a downloaded file".to_owned())
+        })?;
+    let filename = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| Error::YtDlpExecutionFailed("Invalid output filename".to_owned()))?
+        .to_owned();
+    let bytes = tokio::fs::read(&path).await.map_err(Error::IO)?;
+    tokio::fs::remove_file(&path).await.map_err(Error::IO)?;
+
+    Ok((Body::from(bytes), filename))
 }
 
 #[cfg(test)]
@@ -677,17 +742,50 @@ mod api_tests {
         let response = download_handler(Query(DownloadRequest {
             url: youtube_url,
             format_id: lowest_format.format_id.clone(),
+            keep_on_server: true,
         }))
         .await
         .unwrap();
 
-        assert_eq!(response, StatusCode::NO_CONTENT);
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
         assert!(
             Path::new(DOWNLOADS_DIRECTORY)
                 .join("foO1QakhjZE.mp4")
                 .exists()
         );
         cleanup_download();
+    }
+
+    #[tokio::test]
+    async fn youtube_api_downloads_to_client_and_removes_server_file_by_default() {
+        let _guard = LIVE_TEST_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap();
+        cleanup_download();
+
+        let youtube_url = get_env_variable("YOUTUBE_TEST_URL");
+        let formats = list_formats(&youtube_url).await.unwrap();
+        let lowest_format = formats
+            .first()
+            .expect("YouTube formats should not be empty");
+
+        let response = download_handler(Query(DownloadRequest {
+            url: youtube_url,
+            format_id: lowest_format.format_id.clone(),
+            keep_on_server: false,
+        }))
+        .await
+        .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers().get("content-type").unwrap(), "video/mp4");
+        assert!(response.headers().contains_key("content-disposition"));
+        assert!(
+            !Path::new(DOWNLOADS_DIRECTORY)
+                .join("foO1QakhjZE.mp4")
+                .exists()
+        );
     }
 
     #[test]
@@ -707,6 +805,19 @@ mod api_tests {
         assert!(!page.contains("form.reset()"));
         assert!(page.contains("formats.replaceChildren()"));
         assert!(page.contains("@media (prefers-color-scheme: dark)"));
+        assert!(page.contains("download.blob()"));
+        assert!(page.contains("Content-Disposition"));
+    }
+
+    #[test]
+    fn download_request_defaults_to_not_keep_on_server() {
+        let request: DownloadRequest = serde_json::from_value(serde_json::json!({
+            "url": "https://example.com/video",
+            "format_id": "best"
+        }))
+        .unwrap();
+
+        assert!(!request.keep_on_server);
     }
 }
 

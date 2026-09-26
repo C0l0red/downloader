@@ -49,3 +49,11 @@ Download a format with `GET /download`:
 ```text
 /download?url=https%3A%2F%2Fwww.youtube.com%2Fwatch%3Fv%3D...&format_id=401
 ```
+
+Downloads are returned to the client by default and removed from the server
+after the response is opened. Add `keep_on_server=true` to keep the downloaded
+file in the server's `downloads` directory instead:
+
+```text
+/download?url=https%3A%2F%2Fwww.youtube.com%2Fwatch%3Fv%3D...&format_id=401&keep_on_server=true
+```
