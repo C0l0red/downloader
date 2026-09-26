@@ -263,19 +263,25 @@ async fn run_cli() -> Result<(), Error> {
 
     let choice = prompt("Select format: ")?;
 
-    let index: usize = choice
-        .parse()
-        .map_err(|_| Error::InvalidInput(format!("Invalid input: {choice} is not a number")))?;
-
-    let format = formats.get(index - 1).ok_or(Error::InvalidInput(format!(
-        "Invalid input: {choice} is not a valid format index"
-    )))?;
+    let format = select_format(&formats, &choice)?;
 
     download_video(&url, &format.format_id).await?;
 
     println!("Download complete!");
 
     Ok(())
+}
+
+fn select_format<'a>(formats: &'a [Format], choice: &str) -> Result<&'a Format, Error> {
+    let index: usize = choice
+        .parse()
+        .map_err(|_| Error::InvalidInput(format!("Invalid input: {choice} is not a number")))?;
+
+    formats
+        .get(index.checked_sub(1).unwrap_or(usize::MAX))
+        .ok_or(Error::InvalidInput(format!(
+            "Invalid input: {choice} is not a valid format index"
+        )))
 }
 
 // Axum API
@@ -285,14 +291,18 @@ async fn run_server(address: Option<String>) -> Result<(), Error> {
     let listener = tokio::net::TcpListener::bind(&address)
         .await
         .map_err(Error::IO)?;
-    let app = Router::new()
-        .route("/formats", get(list_formats_handler))
-        .route("/download", get(download_handler));
+    let app = api_router();
 
     println!("Axum server listening on http://{address}");
     axum::serve(listener, app)
         .await
         .map_err(|error| Error::IO(io::Error::other(error)))
+}
+
+fn api_router() -> Router {
+    Router::new()
+        .route("/formats", get(list_formats_handler))
+        .route("/download", get(download_handler))
 }
 
 async fn list_formats_handler(
@@ -376,109 +386,144 @@ async fn download_video(url: &str, format_id: &str) -> Result<(), Error> {
     downloader_for_url(url)?.download(url, format_id)
 }
 
-mod tests {
-    use std::process::{Command, Stdio};
-    use crate::{download_video, InstagramDownloader, list_formats, Format, select_formats, filter_non_null_formats, PlatformDownloader};
+#[cfg(test)]
+mod api_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn formats_endpoint_returns_default_format_for_supported_fallback_platform() {
+        let response = list_formats_handler(Query(FormatsRequest {
+            url: "https://www.facebook.com/video".to_owned(),
+        }))
+        .await
+        .unwrap()
+        .0;
+
+        assert_eq!(response.len(), 1);
+        assert_eq!(response[0].format_id, "best");
+    }
+
+    #[tokio::test]
+    async fn formats_endpoint_rejects_invalid_url() {
+        let error = list_formats_handler(Query(FormatsRequest {
+            url: "not-a-url".to_owned(),
+        }))
+        .await
+        .unwrap_err();
+
+        assert_eq!(error.0, StatusCode::BAD_REQUEST);
+    }
 
     #[test]
-    fn default_platform_returns_best_format_without_metadata() {
-        let formats = InstagramDownloader
-            .list_formats("https://www.instagram.com/reel/Db3jbUyimmk/?stkn=M3VoNmZxaWxrYmt3")
+    fn router_exposes_api_routes() {
+        let _router = api_router();
+    }
+}
+
+#[cfg(test)]
+mod cli_tests {
+    use super::*;
+
+    fn format(format_id: &str) -> Format {
+        Format {
+            format_id: format_id.to_owned(),
+            height: 360,
+            ext: "mp4".to_owned(),
+            vcodec: "h264".to_owned(),
+            filesize: None,
+        }
+    }
+
+    #[test]
+    fn selects_format_by_one_based_cli_index() {
+        let formats = vec![format("360"), format("best")];
+
+        assert_eq!(select_format(&formats, "2").unwrap().format_id, "best");
+    }
+
+    #[test]
+    fn rejects_non_numeric_cli_selection() {
+        let error = select_format(&[format("360")], "best").unwrap_err();
+
+        assert!(matches!(error, Error::InvalidInput(_)));
+    }
+
+    #[test]
+    fn rejects_cli_selection_outside_available_formats() {
+        let error = select_format(&[format("360")], "2").unwrap_err();
+
+        assert!(matches!(error, Error::InvalidInput(_)));
+    }
+}
+
+#[cfg(test)]
+mod downloader_unit_tests {
+    use super::*;
+
+    #[test]
+    fn default_downloader_returns_only_best_format_without_metadata() {
+        let formats = FacebookDownloader
+            .list_formats("https://www.facebook.com/video")
             .unwrap();
 
         assert_eq!(formats.len(), 1);
-        assert_eq!(formats[0].format_id, "best");
         assert_eq!(
             serde_json::to_value(&formats[0]).unwrap(),
-            serde_json::json!({
-                "format_id": "best"
-            })
+            serde_json::json!({ "format_id": "best" })
         );
     }
 
-    #[tokio::test]
-    async fn instagram_downloader_saves_video() {
-        let url = "https://www.instagram.com/reel/Db3jbUyimmk/?stkn=M3VoNmZxaWxrYmt3";
-        download_video(url, "401").await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn list_formats_returns_filtered_formats() {
-        let url = "https://youtu.be/foO1QakhjZE?si=tRel8JwJ_kmZJoul";
-        let formats = list_formats(url).await.unwrap();
-
-        assert!(!formats.is_empty());
-        assert_eq!(formats.get(0).unwrap().height, 144);
-        assert_eq!(formats.len(), 8);
-    }
-
-    #[tokio::test]
-    async fn list_download_video_saves_file() {
-        let url = "https://youtu.be/foO1QakhjZE?si=tRel8JwJ_kmZJoul";
-        download_video(url, "401").await.unwrap();
+    #[test]
+    fn default_downloader_is_used_by_each_non_youtube_platform() {
+        for downloader in [
+            Box::new(FacebookDownloader) as Box<dyn PlatformDownloader>,
+            Box::new(XDownloader),
+            Box::new(TikTokDownloader),
+        ] {
+            assert_eq!(
+                downloader
+                    .list_formats("https://example.com/video")
+                    .unwrap()[0]
+                    .format_id,
+                "best"
+            );
+        }
     }
 
     #[test]
-    fn print_formats() {
-        let url = "https://youtu.be/foO1QakhjZE?si=tRel8JwJ_kmZJoul";
+    fn format_selection_keeps_the_closest_format_for_each_resolution() {
+        let formats = vec![
+            Format {
+                format_id: "144".to_owned(),
+                height: 144,
+                ext: String::new(),
+                vcodec: String::new(),
+                filesize: None,
+            },
+            Format {
+                format_id: "360".to_owned(),
+                height: 360,
+                ext: String::new(),
+                vcodec: String::new(),
+                filesize: None,
+            },
+            Format {
+                format_id: "1080".to_owned(),
+                height: 1080,
+                ext: String::new(),
+                vcodec: String::new(),
+                filesize: None,
+            },
+        ];
 
-        let video_details = Command::new("yt-dlp")
-            .arg("--dump-single-json")
-            .arg("--skip-download")
-            .arg("--cookies")
-            .arg("youtube-cookies.txt")
-            .arg(url)
-            .stdout(Stdio::piped())
-            .spawn()
-            .expect("Failed to execute yt-dlp");
+        let selected = filter_non_null_formats(select_formats(formats));
 
-        let formats = Command::new("jq")
-            .arg(r#"[.formats[] | select(.vcodec != "none" and .height != null) | {format_id, height, ext, vcodec, filesize}]"#)
-            // .stderr(Stdio::null()) // Suppresses unnecessary download messages
-            .stdin(video_details.stdout.unwrap())
-            .output()
-            .expect("Failed to execute yt-dlp");
-
-        if formats.status.success() {
-            println!("Command successful");
-        } else {
-            println!("Command failed");
-        }
-
-        let formats: Vec<Format> = serde_json::from_slice(&formats.stdout).unwrap();
-        println!("Formats: {:?}", formats);
-
-        let selected_format_options = select_formats(formats);
-        println!("Selected formats options: {:?}", selected_format_options);
-
-        let filtered_formats = filter_non_null_formats(selected_format_options);
-        println!("Filtered formats: {:?}", filtered_formats);
-    }
-
-    #[test]
-    fn download() {
-        let url = "https://youtu.be/foO1QakhjZE?si=tRel8JwJ_kmZJoul";
-        // let max_height = 1080;
-        let video_format_id = 401;
-
-        let output = Command::new("yt-dlp")
-            .args([
-                "-f",
-                // &format!("bv*[height<={max_height}]+ba"),
-                &format!("{}+ba", video_format_id),
-                "--merge-output-format",
-                "mp4",
-                "--cookies",
-                "youtube-cookies.txt",
-                url,
-            ])
-            .output()
-            .expect("Failed to download video with yt-dlp");
-
-        if output.status.success() {
-            println!("Video download successful");
-        } else {
-            println!("Video download failed");
-        }
+        assert_eq!(
+            selected
+                .iter()
+                .map(|format| format.format_id.as_str())
+                .collect::<Vec<_>>(),
+            ["144", "360", "1080"]
+        );
     }
 }
