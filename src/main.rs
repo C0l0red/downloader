@@ -5,6 +5,8 @@ use axum::{
     routing::get,
 };
 use serde::{Deserialize, Serialize};
+#[cfg(test)]
+use std::sync::{Mutex, OnceLock};
 use std::{
     collections::HashSet,
     io::{self, Write},
@@ -13,6 +15,8 @@ use std::{
 use url::Url;
 
 const MAX_FORMAT_OPTIONS: usize = 10;
+const DOWNLOADS_DIRECTORY: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/downloads");
+const DOWNLOAD_FILE: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/downloads/%(id)s.%(ext)s");
 
 #[tokio::main]
 async fn main() -> Result<(), Error> {
@@ -145,8 +149,10 @@ trait PlatformDownloader {
     }
 
     fn download(&self, url: &str, _format_id: &str) -> Result<(), Error> {
+        std::fs::create_dir_all(DOWNLOADS_DIRECTORY).map_err(Error::IO)?;
+
         Command::new("yt-dlp")
-            .args(["-f", "best", url])
+            .args(["-f", "best", "-o", DOWNLOAD_FILE, url])
             .output()
             .map_err(|error| Error::YtDlpExecutionFailed(error.to_string()))?;
 
@@ -157,14 +163,16 @@ trait PlatformDownloader {
 struct YouTubeDownloader;
 
 impl YouTubeDownloader {
-    const COOKIES_FILE: &'static str = "youtube-cookies.txt";
+    const COOKIES_FILE: &'static str =
+        concat!(env!("CARGO_MANIFEST_DIR"), "/cookies/youtube-cookies.txt");
 }
 
 struct FacebookDownloader;
 struct InstagramDownloader;
 
 impl InstagramDownloader {
-    const COOKIES_FILE: &'static str = "instagram-cookies.txt";
+    const COOKIES_FILE: &'static str =
+        concat!(env!("CARGO_MANIFEST_DIR"), "/cookies/instagram-cookies.txt");
 }
 
 struct XDownloader;
@@ -207,6 +215,8 @@ impl PlatformDownloader for YouTubeDownloader {
             )));
         }
 
+        std::fs::create_dir_all(DOWNLOADS_DIRECTORY).map_err(Error::IO)?;
+
         Command::new("yt-dlp")
             .args([
                 "-f",
@@ -215,10 +225,21 @@ impl PlatformDownloader for YouTubeDownloader {
                 "mp4",
                 "--cookies",
                 Self::COOKIES_FILE,
+                "-o",
+                DOWNLOAD_FILE,
                 url,
             ])
             .output()
-            .map_err(|error| Error::YtDlpExecutionFailed(error.to_string()))?;
+            .map_err(|error| Error::YtDlpExecutionFailed(error.to_string()))
+            .and_then(|output| {
+                if output.status.success() {
+                    Ok(output)
+                } else {
+                    Err(Error::YtDlpExecutionFailed(
+                        String::from_utf8_lossy(&output.stderr).into_owned(),
+                    ))
+                }
+            })?;
 
         Ok(())
     }
@@ -227,8 +248,18 @@ impl PlatformDownloader for YouTubeDownloader {
 impl PlatformDownloader for FacebookDownloader {}
 impl PlatformDownloader for InstagramDownloader {
     fn download(&self, url: &str, _format_id: &str) -> Result<(), Error> {
+        std::fs::create_dir_all(DOWNLOADS_DIRECTORY).map_err(Error::IO)?;
+
         Command::new("yt-dlp")
-            .args(["-f", "best", "--cookies", Self::COOKIES_FILE, url])
+            .args([
+                "-f",
+                "best",
+                "--cookies",
+                Self::COOKIES_FILE,
+                "-o",
+                DOWNLOAD_FILE,
+                url,
+            ])
             .output()
             .map_err(|error| Error::YtDlpExecutionFailed(error.to_string()))?;
 
@@ -387,8 +418,19 @@ async fn download_video(url: &str, format_id: &str) -> Result<(), Error> {
 }
 
 #[cfg(test)]
+static LIVE_TEST_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+#[cfg(test)]
 mod api_tests {
     use super::*;
+    use std::path::Path;
+
+    const YOUTUBE_URL: &str = "https://youtu.be/foO1QakhjZE?si=tRel8JwJ_kmZJoul";
+
+    fn cleanup_download() {
+        let path = Path::new(DOWNLOADS_DIRECTORY).join("foO1QakhjZE.mp4");
+        let _ = std::fs::remove_file(path);
+    }
 
     #[tokio::test]
     async fn formats_endpoint_returns_default_format_for_supported_fallback_platform() {
@@ -414,6 +456,40 @@ mod api_tests {
         assert_eq!(error.0, StatusCode::BAD_REQUEST);
     }
 
+    #[tokio::test]
+    async fn youtube_api_lists_formats_downloads_lowest_format_and_creates_file() {
+        let _guard = LIVE_TEST_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap();
+        cleanup_download();
+
+        let formats = list_formats_handler(Query(FormatsRequest {
+            url: YOUTUBE_URL.to_owned(),
+        }))
+        .await
+        .unwrap()
+        .0;
+        let lowest_format = formats
+            .first()
+            .expect("YouTube formats should not be empty");
+
+        let response = download_handler(Query(DownloadRequest {
+            url: YOUTUBE_URL.to_owned(),
+            format_id: lowest_format.format_id.clone(),
+        }))
+        .await
+        .unwrap();
+
+        assert_eq!(response, StatusCode::NO_CONTENT);
+        assert!(
+            Path::new(DOWNLOADS_DIRECTORY)
+                .join("foO1QakhjZE.mp4")
+                .exists()
+        );
+        cleanup_download();
+    }
+
     #[test]
     fn router_exposes_api_routes() {
         let _router = api_router();
@@ -423,6 +499,14 @@ mod api_tests {
 #[cfg(test)]
 mod cli_tests {
     use super::*;
+    use std::path::Path;
+
+    const YOUTUBE_URL: &str = "https://youtu.be/foO1QakhjZE?si=tRel8JwJ_kmZJoul";
+
+    fn cleanup_download() {
+        let path = Path::new(DOWNLOADS_DIRECTORY).join("foO1QakhjZE.mp4");
+        let _ = std::fs::remove_file(path);
+    }
 
     fn format(format_id: &str) -> Format {
         Format {
@@ -453,6 +537,31 @@ mod cli_tests {
         let error = select_format(&[format("360")], "2").unwrap_err();
 
         assert!(matches!(error, Error::InvalidInput(_)));
+    }
+
+    #[tokio::test]
+    async fn youtube_cli_lists_formats_downloads_lowest_format_and_creates_file() {
+        let _guard = LIVE_TEST_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap();
+        cleanup_download();
+
+        let formats = list_formats(YOUTUBE_URL).await.unwrap();
+        let lowest_format = formats
+            .first()
+            .expect("YouTube formats should not be empty");
+
+        download_video(YOUTUBE_URL, &lowest_format.format_id)
+            .await
+            .unwrap();
+
+        assert!(
+            Path::new(DOWNLOADS_DIRECTORY)
+                .join("foO1QakhjZE.mp4")
+                .exists()
+        );
+        cleanup_download();
     }
 }
 
