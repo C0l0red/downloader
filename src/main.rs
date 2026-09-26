@@ -10,15 +10,19 @@ use serde::{Deserialize, Serialize};
 #[cfg(test)]
 use std::sync::{Mutex, OnceLock};
 use std::{
-    collections::HashSet,
+    collections::HashMap,
     io::{self, Write},
     process::{Command, Stdio},
+    sync::{LazyLock, RwLock},
 };
 use url::Url;
 
 const MAX_FORMAT_OPTIONS: usize = 10;
 const DOWNLOADS_DIRECTORY: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/downloads");
 const DOWNLOAD_FILE: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/downloads/%(id)s.%(ext)s");
+
+static FORMATS_CACHE: LazyLock<RwLock<HashMap<String, Vec<Format>>>> =
+    LazyLock::new(|| RwLock::new(HashMap::new()));
 
 #[tokio::main]
 async fn main() -> Result<(), Error> {
@@ -41,7 +45,7 @@ enum Error {
     UnsupportedPlatform(String),
 }
 
-#[derive(Deserialize, Serialize, Debug)]
+#[derive(Clone, Deserialize, Serialize, Debug)]
 struct Format {
     format_id: String,
     #[serde(skip_serializing_if = "is_zero")]
@@ -86,6 +90,10 @@ struct SelectedFormatOptions {
 
 fn select_formats(mut formats: Vec<Format>) -> SelectedFormatOptions {
     let mut selected_formats = SelectedFormatOptions::default();
+
+    // Filter out incompatible formats
+    formats.retain(|format| is_iphone_compatible(format));
+
     // Sort formats by height and then by filesize presence
     formats.sort_by(|a, b| {
         a.height
@@ -109,6 +117,12 @@ fn select_formats(mut formats: Vec<Format>) -> SelectedFormatOptions {
     }
 
     selected_formats
+}
+
+fn is_iphone_compatible(format: &Format) -> bool {
+    format.ext == "mp4"
+        && format
+        .vcodec.starts_with("avc1")
 }
 
 fn filter_non_null_formats(selected_format_options: SelectedFormatOptions) -> Vec<Format> {
@@ -213,11 +227,14 @@ impl PlatformDownloader for YouTubeDownloader {
     }
 
     fn download(&self, url: &str, format_id: &str) -> Result<(), Error> {
-        let formats = self.list_formats(url)?;
-        let format_ids_set: HashSet<String> =
-            formats.into_iter().map(|format| format.format_id).collect();
+        let formats = FORMATS_CACHE
+            .read()
+            .map_err(|error| Error::InvalidInput(format!("Format cache unavailable: {error}")))?
+            .get(url)
+            .cloned()
+            .map_or_else(|| self.list_formats(url), Ok)?;
 
-        if !format_ids_set.contains(format_id) {
+        if !formats.iter().any(|format| format.format_id == format_id) {
             return Err(Error::InvalidInput(format!(
                 "Format ID not found: {format_id}"
             )));
@@ -232,10 +249,6 @@ impl PlatformDownloader for YouTubeDownloader {
                 &format!("{format_id}+ba"),
                 "--merge-output-format",
                 "mp4",
-                "--recode-video",
-                "mp4",
-                "--postprocessor-args",
-                "Merger+ffmpeg:-c:v libx264 -c:a aac -pix_fmt yuv420p -movflags +faststart",
                 "--cookies",
                 &cookies_file_path,
                 "-o",
@@ -552,7 +565,7 @@ async fn list_formats_handler(
     Query(request): Query<FormatsRequest>,
 ) -> Result<Json<Vec<Format>>, (StatusCode, String)> {
     println!("Received formats request for URL: {}", request.url);
-    list_formats(&request.url)
+    cached_list_formats(&request.url)
         .await
         .map(Json)
         .map_err(api_error)
@@ -590,6 +603,24 @@ async fn download_handler(
             })
             .map_err(api_error)
     }
+}
+
+async fn cached_list_formats(url: &str) -> Result<Vec<Format>, Error> {
+    if let Some(formats) = FORMATS_CACHE
+        .read()
+        .map_err(|error| Error::InvalidInput(format!("Format cache unavailable: {error}")))?
+        .get(url)
+        .cloned()
+    {
+        return Ok(formats);
+    }
+
+    let formats = list_formats(url).await?;
+    FORMATS_CACHE
+        .write()
+        .map_err(|error| Error::InvalidInput(format!("Format cache unavailable: {error}")))?
+        .insert(url.to_owned(), formats.clone());
+    Ok(formats)
 }
 
 fn api_error(error: Error) -> (StatusCode, String) {
