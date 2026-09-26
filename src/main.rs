@@ -155,8 +155,18 @@ trait PlatformDownloader {
 }
 
 struct YouTubeDownloader;
+
+impl YouTubeDownloader {
+    const COOKIES_FILE: &'static str = "youtube-cookies.txt";
+}
+
 struct FacebookDownloader;
 struct InstagramDownloader;
+
+impl InstagramDownloader {
+    const COOKIES_FILE: &'static str = "instagram-cookies.txt";
+}
+
 struct XDownloader;
 struct TikTokDownloader;
 
@@ -166,7 +176,7 @@ impl PlatformDownloader for YouTubeDownloader {
             .arg("--dump-single-json")
             .arg("--skip-download")
             .arg("--cookies")
-            .arg("youtube-cookies.txt")
+            .arg(Self::COOKIES_FILE)
             .arg(url)
             .stdout(Stdio::piped())
             .spawn()
@@ -204,7 +214,7 @@ impl PlatformDownloader for YouTubeDownloader {
                 "--merge-output-format",
                 "mp4",
                 "--cookies",
-                "youtube-cookies.txt",
+                Self::COOKIES_FILE,
                 url,
             ])
             .output()
@@ -218,7 +228,7 @@ impl PlatformDownloader for FacebookDownloader {}
 impl PlatformDownloader for InstagramDownloader {
     fn download(&self, url: &str, _format_id: &str) -> Result<(), Error> {
         Command::new("yt-dlp")
-            .args(["-f", "best", "--cookies", "instagram-cookies.txt", url])
+            .args(["-f", "best", "--cookies", Self::COOKIES_FILE, url])
             .output()
             .map_err(|error| Error::YtDlpExecutionFailed(error.to_string()))?;
 
