@@ -30,14 +30,14 @@ To start the Axum JSON API, use `server` and optionally provide a bind address:
 
 ```sh
 cargo run -- server
-cargo run -- server 0.0.0.0:3000
+cargo run -- server 0.0.0.0:3424
 ```
 
 Open the browser interface at `/ui` to enter a URL, list its formats, and
 start a download by selecting a format:
 
 ```text
-http://localhost:3000/ui
+http://localhost:3424/ui
 ```
 
 List available formats with `GET /formats`:

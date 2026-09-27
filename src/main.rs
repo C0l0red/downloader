@@ -345,7 +345,7 @@ fn select_format<'a>(formats: &'a [Format], choice: &str) -> Result<&'a Format, 
 // Axum API
 
 async fn run_server(address: Option<String>) -> Result<(), Error> {
-    let address = address.unwrap_or_else(|| "0.0.0.0:3000".to_owned());
+    let address = address.unwrap_or_else(|| "0.0.0.0:3424".to_owned());
     let listener = tokio::net::TcpListener::bind(&address)
         .await
         .map_err(Error::IO)?;
