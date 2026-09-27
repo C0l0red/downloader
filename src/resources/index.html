@@ -1,0 +1,192 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Downloader</title>
+  <style>
+    :root {
+      color-scheme: light dark;
+      font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      background: #f3f6fb;
+      color: #172033;
+    }
+
+    body {
+      box-sizing: border-box;
+      display: grid;
+      min-height: 100vh;
+      margin: 0;
+      padding: 1rem;
+      place-items: center;
+    }
+
+    main {
+      box-sizing: border-box;
+      width: min(100%, 36rem);
+      padding: clamp(1.25rem, 5vw, 2.5rem);
+      border: 1px solid #dce3ef;
+      border-radius: 1rem;
+      background: #ffffff;
+      box-shadow: 0 1rem 2.5rem rgb(36 55 85 / 12%);
+    }
+
+    h1 {
+      margin-top: 0;
+      font-size: clamp(1.75rem, 7vw, 2.5rem);
+    }
+
+    form {
+      display: grid;
+      gap: 0.65rem;
+    }
+
+    input,
+    form button,
+    #formats button {
+      box-sizing: border-box;
+      width: 100%;
+      min-height: 3rem;
+      border: 1px solid #b9c7dc;
+      border-radius: 0.6rem;
+      padding: 0.75rem 1rem;
+      font: inherit;
+    }
+
+    form button,
+    #formats button {
+      cursor: pointer;
+      font-weight: 600;
+      transition: transform 120ms ease, box-shadow 120ms ease;
+    }
+
+    form button {
+      border-color: #315fca;
+      background: #315fca;
+      color: white;
+    }
+
+    #formats {
+      display: grid;
+      gap: 0.75rem;
+      margin-top: 1rem;
+    }
+
+    #formats button {
+      display: block;
+      border-color: #b8c8e4;
+      background: #edf3ff;
+      color: #1c3974;
+      font-size: 1.05rem;
+    }
+
+    form button:hover,
+    #formats button:hover {
+      transform: translateY(-1px);
+      box-shadow: 0 0.35rem 0.8rem rgb(36 55 85 / 18%);
+    }
+
+    #message {
+      min-height: 1.5rem;
+      color: #43516a;
+      font-weight: 600;
+    }
+
+    @media (prefers-color-scheme: dark) {
+      :root {
+        background: #111827;
+        color: #e8edf7;
+      }
+
+      main {
+        border-color: #334155;
+        background: #1e293b;
+      }
+
+      input {
+        border-color: #52647f;
+        background: #172033;
+        color: #e8edf7;
+      }
+
+      #formats button {
+        border-color: #526da5;
+        background: #263b68;
+        color: #e8edf7;
+      }
+
+      #message {
+        color: #c1cee3;
+      }
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>Downloader</h1>
+    <form id="formats-form">
+      <label for="url">URL</label>
+      <input id="url" name="url" type="url" required>
+      <button type="submit">List formats</button>
+    </form>
+    <p id="message"></p>
+    <div id="formats"></div>
+  </main>
+  <script>
+    const form = document.getElementById("formats-form");
+    const urlInput = document.getElementById("url");
+    const formats = document.getElementById("formats");
+    const message = document.getElementById("message");
+
+    form.addEventListener("submit", async (event) => {
+      event.preventDefault();
+      formats.replaceChildren();
+      message.textContent = "Loading formats...";
+
+      try {
+        const url = urlInput.value;
+        const response = await fetch(`/formats?url=${encodeURIComponent(url)}`);
+        if (!response.ok) throw new Error(await response.text());
+
+        for (const format of await response.json()) {
+          const button = document.createElement("button");
+          button.type = "button";
+          const label = format.height === undefined && format.format_id === "best"
+            ? "download"
+            : `${format.height}p${format.filesize === undefined
+              ? ""
+              : ` - ${(format.filesize / 1_000_000).toFixed(1)} MB`}`;
+          button.textContent = label;
+          button.addEventListener("click", async () => {
+            message.textContent = "Starting download...";
+            try {
+              const download = await fetch(
+                `/download?url=${encodeURIComponent(url)}&format_id=${encodeURIComponent(format.format_id)}`
+              );
+              if (!download.ok) throw new Error(await download.text());
+
+              const blob = await download.blob();
+              const link = document.createElement("a");
+              link.href = URL.createObjectURL(blob);
+              const disposition = download.headers.get("Content-Disposition");
+              link.download = disposition?.match(/filename="([^"]+)"/)?.[1]
+                ?? `${format.format_id}.mp4`;
+              link.click();
+              URL.revokeObjectURL(link.href);
+
+              formats.replaceChildren();
+              message.textContent = "Download complete";
+            } catch (error) {
+              message.textContent = `Download failed: ${error}`;
+            }
+          });
+          formats.append(button);
+        }
+        message.textContent = "Choose a format:";
+      } catch (error) {
+        message.textContent = `Could not list formats: ${error}`;
+      }
+    });
+  </script>
+</body>
+</html>
