@@ -20,6 +20,7 @@ use url::Url;
 const MAX_FORMAT_OPTIONS: usize = 10;
 const DOWNLOADS_DIRECTORY: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/downloads");
 const DOWNLOAD_FILE: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/downloads/%(id)s.%(ext)s");
+const DEFAULT_ADDRESS: &str = "0.0.0.0:3424";
 
 static FORMATS_CACHE: LazyLock<RwLock<HashMap<String, Vec<Format>>>> =
     LazyLock::new(|| RwLock::new(HashMap::new()));
@@ -181,14 +182,14 @@ trait PlatformDownloader {
 struct YouTubeDownloader;
 
 impl YouTubeDownloader {
-    const COOKIES_FILE_ENV_KEY: &'static str = "YOUTUBE_COOKIES_FILE";
+    const COOKIES_FILE_PATH_ENV_KEY: &'static str = "YOUTUBE_COOKIES_FILE";
 }
 
 struct FacebookDownloader;
 struct InstagramDownloader;
 
 impl InstagramDownloader {
-    const COOKIES_FILE_ENV_KEY: &'static str = "INSTAGRAM_COOKIES_FILE";
+    const COOKIES_FILE_PATH_ENV_KEY: &'static str = "INSTAGRAM_COOKIES_FILE";
 }
 
 struct XDownloader;
@@ -201,7 +202,7 @@ fn get_cookies_file_path(name: &str) -> Result<String, Error> {
 
 impl PlatformDownloader for YouTubeDownloader {
     fn list_formats(&self, url: &str) -> Result<Vec<Format>, Error> {
-        let cookies_file_path = get_cookies_file_path(Self::COOKIES_FILE_ENV_KEY)?;
+        let cookies_file_path = get_cookies_file_path(Self::COOKIES_FILE_PATH_ENV_KEY)?;
         let video_details = Command::new("yt-dlp")
             .arg("--dump-single-json")
             .arg("--skip-download")
@@ -241,7 +242,7 @@ impl PlatformDownloader for YouTubeDownloader {
         }
 
         std::fs::create_dir_all(DOWNLOADS_DIRECTORY).map_err(Error::IO)?;
-        let cookies_file_path = get_cookies_file_path(Self::COOKIES_FILE_ENV_KEY)?;
+        let cookies_file_path = get_cookies_file_path(Self::COOKIES_FILE_PATH_ENV_KEY)?;
 
         Command::new("yt-dlp")
             .args([
@@ -275,7 +276,7 @@ impl PlatformDownloader for FacebookDownloader {}
 impl PlatformDownloader for InstagramDownloader {
     fn download(&self, url: &str, _format_id: &str) -> Result<(), Error> {
         std::fs::create_dir_all(DOWNLOADS_DIRECTORY).map_err(Error::IO)?;
-        let cookies_file_path = get_cookies_file_path(Self::COOKIES_FILE_ENV_KEY)?;
+        let cookies_file_path = get_cookies_file_path(Self::COOKIES_FILE_PATH_ENV_KEY)?;
 
         Command::new("yt-dlp")
             .args([
@@ -345,7 +346,7 @@ fn select_format<'a>(formats: &'a [Format], choice: &str) -> Result<&'a Format, 
 // Axum API
 
 async fn run_server(address: Option<String>) -> Result<(), Error> {
-    let address = address.unwrap_or_else(|| "0.0.0.0:3424".to_owned());
+    let address = address.unwrap_or_else(|| DEFAULT_ADDRESS.to_owned());
     let listener = tokio::net::TcpListener::bind(&address)
         .await
         .map_err(Error::IO)?;
