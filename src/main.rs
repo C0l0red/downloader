@@ -7,6 +7,8 @@ use axum::{
     routing::get,
 };
 use serde::{Deserialize, Serialize};
+use std::array::IntoIter;
+use std::path::Path;
 #[cfg(test)]
 use std::sync::{Mutex, OnceLock};
 use std::{
@@ -15,7 +17,6 @@ use std::{
     process::{Command, Stdio},
     sync::{LazyLock, RwLock},
 };
-use std::path::Path;
 use url::Url;
 
 const MAX_FORMAT_OPTIONS: usize = 10;
@@ -113,11 +114,34 @@ struct SelectedFormatOptions {
     larger_than_4320p: Option<Format>,
 }
 
-fn select_formats(mut formats: Vec<Format>) -> SelectedFormatOptions {
+impl IntoIterator for SelectedFormatOptions {
+    type Item = Option<Format>;
+    type IntoIter = IntoIter<Option<Format>, MAX_FORMAT_OPTIONS>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        [
+            self.closest_to_144p,
+            self.closest_to_240p,
+            self.closest_to_360p,
+            self.closest_to_480p,
+            self.closest_to_720p,
+            self.closest_to_1080p,
+            self.closest_to_1440p,
+            self.closest_to_2160p,
+            self.closest_to_4320p,
+            self.larger_than_4320p,
+        ]
+            .into_iter()
+    }
+}
+
+fn select_formats(mut formats: Vec<Format>, predicates: &[&dyn FormatPredicate]) -> SelectedFormatOptions {
     let mut selected_formats = SelectedFormatOptions::default();
 
-    // Filter out incompatible formats
-    formats.retain(|format| is_iphone_compatible(format));
+    // Filter out unwanted formats
+    for predicate in predicates {
+        formats.retain(|format| predicate.matches(format));
+    }
 
     // Sort formats by height and then by filesize presence
     formats.sort_by(|a, b| {
@@ -144,29 +168,16 @@ fn select_formats(mut formats: Vec<Format>) -> SelectedFormatOptions {
     selected_formats
 }
 
-fn is_iphone_compatible(format: &Format) -> bool {
-    format.ext == "mp4" && format.vcodec.starts_with("avc1")
+trait FormatPredicate {
+    fn matches(&self, format: &Format) -> bool;
 }
 
-fn filter_non_null_formats(selected_format_options: SelectedFormatOptions) -> Vec<Format> {
-    let selected_format_values: [Option<Format>; MAX_FORMAT_OPTIONS] = [
-        selected_format_options.closest_to_144p,
-        selected_format_options.closest_to_240p,
-        selected_format_options.closest_to_360p,
-        selected_format_options.closest_to_480p,
-        selected_format_options.closest_to_720p,
-        selected_format_options.closest_to_1080p,
-        selected_format_options.closest_to_1440p,
-        selected_format_options.closest_to_2160p,
-        selected_format_options.closest_to_4320p,
-        selected_format_options.larger_than_4320p,
-    ];
+struct IsIphoneCompatible;
 
-    selected_format_values
-        .into_iter()
-        .filter(|format| format.is_some())
-        .map(|format| format.unwrap())
-        .collect()
+impl FormatPredicate for IsIphoneCompatible {
+    fn matches(&self, format: &Format) -> bool {
+        format.ext == "mp4" && format.vcodec.starts_with("avc1")
+    }
 }
 
 #[derive(Deserialize, Debug)]
@@ -242,9 +253,9 @@ impl PlatformDownloader for YouTubeDownloader {
         let formats: Vec<Format> = serde_json::from_slice(&formats_bytes.stdout)
             .map_err(|error| Error::FormatDeserializationFailed(error.to_string()))?;
 
-        let selected_format_options = select_formats(formats);
-
-        Ok(filter_non_null_formats(selected_format_options))
+        // Filter out formats incompatible with iPhone
+        let predicates: &[&dyn FormatPredicate] = &[&IsIphoneCompatible];
+        Ok(select_formats(formats, predicates).into_iter().flatten().collect())
     }
 
     fn download(&self, url: &str, format_id: &str) -> Result<(), Error> {
@@ -1005,7 +1016,8 @@ mod downloader_unit_tests {
             },
         ];
 
-        let selected = filter_non_null_formats(select_formats(formats));
+        let predicates = &[];
+        let selected: Vec<Format> = select_formats(formats, predicates).into_iter().flatten().collect();
 
         assert_eq!(
             selected
