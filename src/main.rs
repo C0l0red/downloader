@@ -3,12 +3,12 @@ use axum::{
     body::Body,
     extract::{Json, Query, State},
     http::StatusCode,
-    response::{Html, Response},
+    response::{Html, IntoResponse, Response},
     routing::get,
 };
 use serde::{Deserialize, Serialize};
 use std::array::IntoIter;
-use std::path::{PathBuf};
+use std::path::PathBuf;
 #[cfg(test)]
 use std::sync::{Mutex, OnceLock};
 use std::{
@@ -24,6 +24,14 @@ const DEFAULT_ADDRESS: &str = "0.0.0.0:3424";
 
 #[tokio::main]
 async fn main() -> Result<(), Error> {
+    let result = run().await;
+    if let Err(error) = &result {
+        error.log();
+    }
+    result
+}
+
+async fn run() -> Result<(), Error> {
     let state = AppState::from_environment()?;
     if std::env::args().nth(1).as_deref() == Some("server") {
         let address = std::env::args().nth(2);
@@ -45,6 +53,51 @@ enum Error {
     UnsupportedPlatform(String),
     NotAValidPath(String),
     MissingArgument(String),
+    Internal(String),
+}
+
+impl Error {
+    fn log(&self) {
+        eprintln!("Application error: {self:?}");
+    }
+}
+
+impl IntoResponse for Error {
+    fn into_response(self) -> Response<Body> {
+        self.log();
+        let (status, message) = match self {
+            Self::InvalidInput(message) | Self::UnsupportedPlatform(message) => {
+                (StatusCode::BAD_REQUEST, message)
+            }
+            Self::YtDlpExecutionFailed(_) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "An error occurred while downloading or getting metadata for the media".to_owned(),
+            ),
+            Self::JqExecutionFailed(_) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "An error occurred while reading the media formats".to_owned(),
+            ),
+            Self::FormatDeserializationFailed(_) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "An error occurred while processing the media formats".to_owned(),
+            ),
+            Self::IO(_) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "An error occurred while accessing the filesystem".to_owned(),
+            ),
+            Self::NotAValidPath(_) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "An error occurred while loading the application configuration".to_owned(),
+            ),
+            Self::MissingArgument(_) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "An error occurred while loading the application configuration".to_owned(),
+            ),
+            Self::Internal(message) => (StatusCode::INTERNAL_SERVER_ERROR, message),
+        };
+
+        (status, message).into_response()
+    }
 }
 
 #[derive(Clone, Deserialize, Serialize, Debug)]
@@ -231,7 +284,11 @@ struct IsIphoneCompatible;
 
 impl FormatPredicate for IsIphoneCompatible {
     fn matches(&self, format: &Format) -> bool {
-        format.ext == "mp4" && format.vcodec.as_ref().is_some_and(|vcodec| vcodec.starts_with("avc1"))
+        format.ext == "mp4"
+            && format
+                .vcodec
+                .as_ref()
+                .is_some_and(|vcodec| vcodec.starts_with("avc1"))
     }
 }
 
@@ -271,7 +328,16 @@ trait PlatformDownloader {
                 url,
             ])
             .output()
-            .map_err(|error| Error::YtDlpExecutionFailed(error.to_string()))?;
+            .map_err(|error| Error::YtDlpExecutionFailed(error.to_string()))
+            .and_then(|output| {
+                if output.status.success() {
+                    Ok(output)
+                } else {
+                    Err(Error::YtDlpExecutionFailed(
+                        String::from_utf8_lossy(&output.stderr).into_owned(),
+                    ))
+                }
+            })?;
 
         Ok(())
     }
@@ -325,7 +391,7 @@ impl PlatformDownloader for YouTubeDownloader {
     ) -> Result<(), Error> {
         let formats = formats_cache
             .read()
-            .map_err(|error| Error::InvalidInput(format!("Format cache unavailable: {error}")))?
+            .map_err(|_| Error::Internal("Accessing the format cache failed".to_owned()))?
             .get(url)
             .cloned()
             .map_or_else(|| self.list_formats(url), Ok)?;
@@ -391,7 +457,16 @@ impl PlatformDownloader for InstagramDownloader {
                 url,
             ])
             .output()
-            .map_err(|error| Error::YtDlpExecutionFailed(error.to_string()))?;
+            .map_err(|error| Error::YtDlpExecutionFailed(error.to_string()))
+            .and_then(|output| {
+                if output.status.success() {
+                    Ok(output)
+                } else {
+                    Err(Error::YtDlpExecutionFailed(
+                        String::from_utf8_lossy(&output.stderr).into_owned(),
+                    ))
+                }
+            })?;
 
         Ok(())
     }
@@ -475,18 +550,17 @@ async fn ui_handler() -> Html<&'static str> {
 async fn list_formats_handler(
     State(state): State<Arc<AppState>>,
     Query(request): Query<FormatsRequest>,
-) -> Result<Json<Vec<FormatResponse>>, (StatusCode, String)> {
+) -> Result<Json<Vec<FormatResponse>>, Error> {
     println!("Received formats request for URL: {}", request.url);
     cached_list_formats(&request.url, &state)
         .await
         .map(|formats| Json(formats.into_iter().map(FormatResponse::from).collect()))
-        .map_err(api_error)
 }
 
 async fn download_handler(
     State(state): State<Arc<AppState>>,
     Query(request): Query<DownloadRequest>,
-) -> Result<Response<Body>, (StatusCode, String)> {
+) -> Result<Response<Body>, Error> {
     println!(
         "Received download request for URL: {} with format: {} (keep_on_server: {})",
         request.url, request.format_id, request.keep_on_server
@@ -494,17 +568,16 @@ async fn download_handler(
     if request.keep_on_server {
         download_video(&request.url, &request.format_id, &state)
             .await
-            .map(|()| {
+            .and_then(|()| {
                 Response::builder()
                     .status(StatusCode::NO_CONTENT)
                     .body(Body::empty())
-                    .unwrap()
+                    .map_err(|_| Error::Internal("Building the response failed".to_owned()))
             })
-            .map_err(api_error)
     } else {
         download_for_client(&request.url, &request.format_id, &state)
             .await
-            .map(|(body, filename)| {
+            .and_then(|(body, filename)| {
                 Response::builder()
                     .header("content-type", "video/mp4")
                     .header(
@@ -512,9 +585,8 @@ async fn download_handler(
                         format!("attachment; filename=\"{filename}\""),
                     )
                     .body(body)
-                    .unwrap()
+                    .map_err(|_| Error::Internal("Building the response failed".to_owned()))
             })
-            .map_err(api_error)
     }
 }
 
@@ -522,7 +594,7 @@ async fn cached_list_formats(url: &str, state: &AppState) -> Result<Vec<Format>,
     if let Some(formats) = state
         .formats_cache
         .read()
-        .map_err(|error| Error::InvalidInput(format!("Format cache unavailable: {error}")))?
+        .map_err(|_| Error::Internal("Accessing the format cache failed".to_owned()))?
         .get(url)
         .cloned()
     {
@@ -533,13 +605,9 @@ async fn cached_list_formats(url: &str, state: &AppState) -> Result<Vec<Format>,
     state
         .formats_cache
         .write()
-        .map_err(|error| Error::InvalidInput(format!("Format cache unavailable: {error}")))?
+        .map_err(|_| Error::Internal("Accessing the format cache failed".to_owned()))?
         .insert(url.to_owned(), formats.clone());
     Ok(formats)
-}
-
-fn api_error(error: Error) -> (StatusCode, String) {
-    (StatusCode::BAD_REQUEST, format!("{error:?}"))
 }
 
 fn prompt(message: &str) -> Result<String, Error> {
@@ -617,20 +685,29 @@ async fn download_for_client(
 ) -> Result<(Body, String), Error> {
     download_video(url, format_id, state).await?;
 
-    let path = std::fs::read_dir(&state.config.downloads_directory)
-        .map_err(Error::IO)?
-        .filter_map(Result::ok)
-        .filter(|entry| entry.path().is_file())
-        .max_by_key(|entry| {
-            entry
-                .metadata()
-                .and_then(|metadata| metadata.modified())
-                .ok()
-        })
-        .map(|entry| entry.path())
-        .ok_or_else(|| {
-            Error::YtDlpExecutionFailed("yt-dlp did not produce a downloaded file".to_owned())
-        })?;
+    let mut newest_file = None;
+    for entry in std::fs::read_dir(&state.config.downloads_directory).map_err(Error::IO)? {
+        let entry = entry.map_err(Error::IO)?;
+        if !entry.path().is_file() {
+            continue;
+        }
+
+        let modified = entry
+            .metadata()
+            .map_err(Error::IO)?
+            .modified()
+            .map_err(Error::IO)?;
+        if newest_file
+            .as_ref()
+            .is_none_or(|(newest_modified, _)| modified > *newest_modified)
+        {
+            newest_file = Some((modified, entry.path()));
+        }
+    }
+
+    let path = newest_file.map(|(_, path)| path).ok_or_else(|| {
+        Error::YtDlpExecutionFailed("yt-dlp did not produce a downloaded file".to_owned())
+    })?;
     let filename = path
         .file_name()
         .and_then(|name| name.to_str())
@@ -698,7 +775,26 @@ mod api_tests {
         .await
         .unwrap_err();
 
-        assert_eq!(error.0, StatusCode::BAD_REQUEST);
+        assert_eq!(error.into_response().status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn internal_errors_return_their_descriptive_message() {
+        let message = "Building the response failed";
+        let response = Error::Internal(message.to_owned()).into_response();
+
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(body.as_ref(), message.as_bytes());
+    }
+
+    #[test]
+    fn client_input_errors_return_their_message() {
+        let response = Error::InvalidInput("Invalid URL".to_owned()).into_response();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]
@@ -977,11 +1073,13 @@ fn test_command() {
         .arg("https://youtu.be/foO1QakhjZE?si=tRel8JwJ_kmZJoul")
         .stdout(Stdio::piped())
         .spawn()
-        .map_err(|error| Error::YtDlpExecutionFailed(error.to_string())).unwrap();
+        .map_err(|error| Error::YtDlpExecutionFailed(error.to_string()))
+        .unwrap();
 
     let formats_bytes = Command::new("jq")
         // .arg(r#"[.formats[] | select(.vcodec != "none" and .height != null) | {format_id, height, ext, vcodec, acodec, filesize}]"#)
-        .arg(r#"
+        .arg(
+            r#"
         {
           title,
           thumbnail,
@@ -1004,10 +1102,12 @@ fn test_command() {
             }
           ]
         }
-        "#)
+        "#,
+        )
         .stdin(video_details.stdout.unwrap())
         .output()
-        .map_err(|error| Error::JqExecutionFailed(error.to_string())).unwrap();
+        .map_err(|error| Error::JqExecutionFailed(error.to_string()))
+        .unwrap();
 
     if formats_bytes.status.success() {
         let formats_string = String::from_utf8(formats_bytes.stdout).unwrap();
