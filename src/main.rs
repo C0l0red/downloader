@@ -18,8 +18,21 @@ use std::{
 use url::Url;
 
 const MAX_FORMAT_OPTIONS: usize = 10;
-const DOWNLOADS_DIRECTORY: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/downloads");
-const DOWNLOAD_FILE: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/downloads/%(id)s.%(ext)s");
+const DEFAULT_DOWNLOADS_DIRECTORY: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/downloads");
+static DOWNLOADS_DIRECTORY: LazyLock<String> = LazyLock::new(|| {
+    dotenvy::dotenv().ok();
+    std::env::var("DOWNLOADS_DIRECTORY")
+        .ok()
+        .filter(|path| !path.is_empty())
+        .unwrap_or_else(|| DEFAULT_DOWNLOADS_DIRECTORY.to_owned())
+});
+/// The download file template. yt-dlp will substitute id and ext with the corresponding values for each file.
+static DOWNLOAD_FILE: LazyLock<String> = LazyLock::new(|| {
+    format!(
+        "{}/%(id)s.%(ext)s",
+        DOWNLOADS_DIRECTORY.trim_end_matches('/')
+    )
+});
 const DEFAULT_ADDRESS: &str = "0.0.0.0:3424";
 
 static FORMATS_CACHE: LazyLock<RwLock<HashMap<String, Vec<Format>>>> =
@@ -121,9 +134,7 @@ fn select_formats(mut formats: Vec<Format>) -> SelectedFormatOptions {
 }
 
 fn is_iphone_compatible(format: &Format) -> bool {
-    format.ext == "mp4"
-        && format
-        .vcodec.starts_with("avc1")
+    format.ext == "mp4" && format.vcodec.starts_with("avc1")
 }
 
 fn filter_non_null_formats(selected_format_options: SelectedFormatOptions) -> Vec<Format> {
@@ -168,10 +179,10 @@ trait PlatformDownloader {
     }
 
     fn download(&self, url: &str, _format_id: &str) -> Result<(), Error> {
-        std::fs::create_dir_all(DOWNLOADS_DIRECTORY).map_err(Error::IO)?;
+        std::fs::create_dir_all(DOWNLOADS_DIRECTORY.as_str()).map_err(Error::IO)?;
 
         Command::new("yt-dlp")
-            .args(["-f", "best", "-o", DOWNLOAD_FILE, url])
+            .args(["-f", "best", "-o", DOWNLOAD_FILE.as_str(), url])
             .output()
             .map_err(|error| Error::YtDlpExecutionFailed(error.to_string()))?;
 
@@ -241,7 +252,7 @@ impl PlatformDownloader for YouTubeDownloader {
             )));
         }
 
-        std::fs::create_dir_all(DOWNLOADS_DIRECTORY).map_err(Error::IO)?;
+        std::fs::create_dir_all(DOWNLOADS_DIRECTORY.as_str()).map_err(Error::IO)?;
         let cookies_file_path = get_cookies_file_path(Self::COOKIES_FILE_PATH_ENV_KEY)?;
 
         Command::new("yt-dlp")
@@ -253,7 +264,7 @@ impl PlatformDownloader for YouTubeDownloader {
                 "--cookies",
                 &cookies_file_path,
                 "-o",
-                DOWNLOAD_FILE,
+                DOWNLOAD_FILE.as_str(),
                 url,
             ])
             .output()
@@ -275,7 +286,7 @@ impl PlatformDownloader for YouTubeDownloader {
 impl PlatformDownloader for FacebookDownloader {}
 impl PlatformDownloader for InstagramDownloader {
     fn download(&self, url: &str, _format_id: &str) -> Result<(), Error> {
-        std::fs::create_dir_all(DOWNLOADS_DIRECTORY).map_err(Error::IO)?;
+        std::fs::create_dir_all(DOWNLOADS_DIRECTORY.as_str()).map_err(Error::IO)?;
         let cookies_file_path = get_cookies_file_path(Self::COOKIES_FILE_PATH_ENV_KEY)?;
 
         Command::new("yt-dlp")
@@ -285,7 +296,7 @@ impl PlatformDownloader for InstagramDownloader {
                 "--cookies",
                 &cookies_file_path,
                 "-o",
-                DOWNLOAD_FILE,
+                DOWNLOAD_FILE.as_str(),
                 url,
             ])
             .output()
@@ -690,7 +701,7 @@ async fn download_video(url: &str, format_id: &str) -> Result<(), Error> {
 async fn download_for_client(url: &str, format_id: &str) -> Result<(Body, String), Error> {
     download_video(url, format_id).await?;
 
-    let path = std::fs::read_dir(DOWNLOADS_DIRECTORY)
+    let path = std::fs::read_dir(DOWNLOADS_DIRECTORY.as_str())
         .map_err(Error::IO)?
         .filter_map(Result::ok)
         .filter(|entry| entry.path().is_file())
@@ -730,7 +741,7 @@ mod api_tests {
     use std::path::Path;
 
     fn cleanup_download() {
-        let path = Path::new(DOWNLOADS_DIRECTORY).join("foO1QakhjZE.mp4");
+        let path = Path::new(DOWNLOADS_DIRECTORY.as_str()).join("foO1QakhjZE.mp4");
         let _ = std::fs::remove_file(path);
     }
 
@@ -787,7 +798,7 @@ mod api_tests {
 
         assert_eq!(response.status(), StatusCode::NO_CONTENT);
         assert!(
-            Path::new(DOWNLOADS_DIRECTORY)
+            Path::new(DOWNLOADS_DIRECTORY.as_str())
                 .join("foO1QakhjZE.mp4")
                 .exists()
         );
@@ -820,7 +831,7 @@ mod api_tests {
         assert_eq!(response.headers().get("content-type").unwrap(), "video/mp4");
         assert!(response.headers().contains_key("content-disposition"));
         assert!(
-            !Path::new(DOWNLOADS_DIRECTORY)
+            !Path::new(DOWNLOADS_DIRECTORY.as_str())
                 .join("foO1QakhjZE.mp4")
                 .exists()
         );
@@ -865,7 +876,7 @@ mod cli_tests {
     use std::path::Path;
 
     fn cleanup_download() {
-        let path = Path::new(DOWNLOADS_DIRECTORY).join("foO1QakhjZE.mp4");
+        let path = Path::new(DOWNLOADS_DIRECTORY.as_str()).join("foO1QakhjZE.mp4");
         let _ = std::fs::remove_file(path);
     }
 
@@ -919,7 +930,7 @@ mod cli_tests {
             .unwrap();
 
         assert!(
-            Path::new(DOWNLOADS_DIRECTORY)
+            Path::new(DOWNLOADS_DIRECTORY.as_str())
                 .join("foO1QakhjZE.mp4")
                 .exists()
         );
@@ -967,22 +978,22 @@ mod downloader_unit_tests {
             Format {
                 format_id: "144".to_owned(),
                 height: 144,
-                ext: String::new(),
-                vcodec: String::new(),
+                ext: "mp4".to_owned(),
+                vcodec: "avc1".to_owned(),
                 filesize: None,
             },
             Format {
                 format_id: "360".to_owned(),
                 height: 360,
-                ext: String::new(),
-                vcodec: String::new(),
+                ext: "mp4".to_owned(),
+                vcodec: "avc1".to_owned(),
                 filesize: None,
             },
             Format {
                 format_id: "1080".to_owned(),
                 height: 1080,
-                ext: String::new(),
-                vcodec: String::new(),
+                ext: "mp4".to_owned(),
+                vcodec: "avc1".to_owned(),
                 filesize: None,
             },
         ];
