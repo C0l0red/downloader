@@ -15,6 +15,7 @@ use std::{
     process::{Command, Stdio},
     sync::{LazyLock, RwLock},
 };
+use std::path::Path;
 use url::Url;
 
 const MAX_FORMAT_OPTIONS: usize = 10;
@@ -25,13 +26,7 @@ static DOWNLOADS_DIRECTORY: LazyLock<String> = LazyLock::new(|| {
         .ok()
         .filter(|path| !path.is_empty())
         .unwrap_or_else(|| DEFAULT_DOWNLOADS_DIRECTORY.to_owned())
-});
-/// The download file template. yt-dlp will substitute id and ext with the corresponding values for each file.
-static DOWNLOAD_FILE: LazyLock<String> = LazyLock::new(|| {
-    format!(
-        "{}/%(id)s.%(ext)s",
-        DOWNLOADS_DIRECTORY.trim_end_matches('/')
-    )
+
 });
 const DEFAULT_ADDRESS: &str = "0.0.0.0:3424";
 
@@ -40,6 +35,7 @@ static FORMATS_CACHE: LazyLock<RwLock<HashMap<String, Vec<Format>>>> =
 
 #[tokio::main]
 async fn main() -> Result<(), Error> {
+    ensure_directory_exists(&DOWNLOADS_DIRECTORY)?;
     if std::env::args().nth(1).as_deref() == Some("server") {
         return run_server(std::env::args().nth(2)).await;
     }
@@ -74,6 +70,21 @@ struct Format {
 
 fn is_zero(value: &u16) -> bool {
     *value == 0
+}
+
+fn ensure_directory_exists(path: &str) -> Result<(), Error> {
+    if !Path::new(path).exists() {
+        std::fs::create_dir_all(path).map_err(Error::IO)?;
+    }
+    Ok(())
+}
+
+/// Gets the download file name template. yt-dlp will substitute id and ext with the corresponding values for each file.
+fn get_download_file_path() -> String {
+    format!(
+        "{}/%(id)s.%(ext)s",
+        DOWNLOADS_DIRECTORY.trim_end_matches('/')
+    )
 }
 
 impl Format {
@@ -179,10 +190,8 @@ trait PlatformDownloader {
     }
 
     fn download(&self, url: &str, _format_id: &str) -> Result<(), Error> {
-        std::fs::create_dir_all(DOWNLOADS_DIRECTORY.as_str()).map_err(Error::IO)?;
-
         Command::new("yt-dlp")
-            .args(["-f", "best", "-o", DOWNLOAD_FILE.as_str(), url])
+            .args(["-f", "best", "-o", get_download_file_path().as_str(), url])
             .output()
             .map_err(|error| Error::YtDlpExecutionFailed(error.to_string()))?;
 
@@ -252,7 +261,6 @@ impl PlatformDownloader for YouTubeDownloader {
             )));
         }
 
-        std::fs::create_dir_all(DOWNLOADS_DIRECTORY.as_str()).map_err(Error::IO)?;
         let cookies_file_path = get_cookies_file_path(Self::COOKIES_FILE_PATH_ENV_KEY)?;
 
         Command::new("yt-dlp")
@@ -264,7 +272,7 @@ impl PlatformDownloader for YouTubeDownloader {
                 "--cookies",
                 &cookies_file_path,
                 "-o",
-                DOWNLOAD_FILE.as_str(),
+                get_download_file_path().as_str(),
                 url,
             ])
             .output()
@@ -286,7 +294,6 @@ impl PlatformDownloader for YouTubeDownloader {
 impl PlatformDownloader for FacebookDownloader {}
 impl PlatformDownloader for InstagramDownloader {
     fn download(&self, url: &str, _format_id: &str) -> Result<(), Error> {
-        std::fs::create_dir_all(DOWNLOADS_DIRECTORY.as_str()).map_err(Error::IO)?;
         let cookies_file_path = get_cookies_file_path(Self::COOKIES_FILE_PATH_ENV_KEY)?;
 
         Command::new("yt-dlp")
@@ -296,7 +303,7 @@ impl PlatformDownloader for InstagramDownloader {
                 "--cookies",
                 &cookies_file_path,
                 "-o",
-                DOWNLOAD_FILE.as_str(),
+                get_download_file_path().as_str(),
                 url,
             ])
             .output()
