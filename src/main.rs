@@ -95,10 +95,25 @@ impl IntoResponse for Error {
     }
 }
 
+#[derive(Debug, Deserialize, Serialize)]
+struct MediaMetadata {
+    title: String,
+    thumbnail: Option<String>,
+    formats: Vec<Format>,
+    entries: Option<Vec<MediaEntryMetadata>>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct MediaEntryMetadata {
+    title: String,
+    thumbnail: String,
+    formats: Vec<Format>,
+}
+
 #[derive(Clone, Deserialize, Serialize, Debug)]
 struct Format {
     format_id: String,
-    height: u16,
+    height: Option<u16>,
     ext: String,
     vcodec: Option<String>,
     acodec: Option<String>,
@@ -176,7 +191,8 @@ impl From<Format> for FormatResponse {
     fn from(format: Format) -> Self {
         Self {
             format_id: format.format_id,
-            height: format.height,
+            // FIXME: This should be addressed later
+            height: format.height.unwrap_or(0),
             filesize: format.filesize,
         }
     }
@@ -191,7 +207,7 @@ impl Format {
     fn best() -> Self {
         Self {
             format_id: "best".to_owned(),
-            height: 0,
+            height: None,
             ext: String::new(),
             vcodec: None,
             acodec: None,
@@ -255,16 +271,17 @@ fn select_formats(
 
     for format in formats {
         match format.height {
-            res if res <= 144 => selected_formats.closest_to_144p = Some(format),
-            res if res <= 144 + 240 / 2 => selected_formats.closest_to_240p = Some(format),
-            res if res <= 240 + 360 / 2 => selected_formats.closest_to_360p = Some(format),
-            res if res <= 360 + 480 / 2 => selected_formats.closest_to_480p = Some(format),
-            res if res <= 480 + 720 / 2 => selected_formats.closest_to_720p = Some(format),
-            res if res <= 720 + 1080 / 2 => selected_formats.closest_to_1080p = Some(format),
-            res if res <= 1080 + 1440 / 2 => selected_formats.closest_to_1440p = Some(format),
-            res if res <= 1440 + 2160 / 2 => selected_formats.closest_to_2160p = Some(format),
-            res if res <= 2160 + 4320 / 2 => selected_formats.closest_to_4320p = Some(format),
-            _ => selected_formats.larger_than_4320p = Some(format),
+            Some(res) if res <= 144 => selected_formats.closest_to_144p = Some(format),
+            Some(res) if res <= 144 + 240 / 2 => selected_formats.closest_to_240p = Some(format),
+            Some(res) if res <= 240 + 360 / 2 => selected_formats.closest_to_360p = Some(format),
+            Some(res) if res <= 360 + 480 / 2 => selected_formats.closest_to_480p = Some(format),
+            Some(res) if res <= 480 + 720 / 2 => selected_formats.closest_to_720p = Some(format),
+            Some(res) if res <= 720 + 1080 / 2 => selected_formats.closest_to_1080p = Some(format),
+            Some(res) if res <= 1080 + 1440 / 2 => selected_formats.closest_to_1440p = Some(format),
+            Some(res) if res <= 1440 + 2160 / 2 => selected_formats.closest_to_2160p = Some(format),
+            Some(res) if res <= 2160 + 4320 / 2 => selected_formats.closest_to_4320p = Some(format),
+            Some(_) => selected_formats.larger_than_4320p = Some(format),
+            None => {}
         }
     }
 
@@ -543,10 +560,14 @@ async fn run_cli(state: &AppState) -> Result<(), Error> {
         println!(
             "{}. {}p - {}",
             index + 1,
-            if format.height == 0 {
-                "best".to_owned()
+            if let Some(height) = format.height {
+                if height == 0 {
+                    "best".to_owned()
+                } else {
+                    height.to_string()
+                }
             } else {
-                format.height.to_string()
+                "best".to_string()
             },
             format
                 .filesize
@@ -983,7 +1004,7 @@ mod cli_tests {
     fn format(format_id: &str) -> Format {
         Format {
             format_id: format_id.to_owned(),
-            height: 360,
+            height: Some(360),
             ext: "mp4".to_owned(),
             vcodec: Some("h264".to_owned()),
             acodec: Some("aac".to_owned()),
@@ -1079,7 +1100,7 @@ mod downloader_unit_tests {
         let formats = vec![
             Format {
                 format_id: "144".to_owned(),
-                height: 144,
+                height: Some(144),
                 ext: "mp4".to_owned(),
                 vcodec: Some("avc1".to_owned()),
                 acodec: Some("aac".to_owned()),
@@ -1087,7 +1108,7 @@ mod downloader_unit_tests {
             },
             Format {
                 format_id: "360".to_owned(),
-                height: 360,
+                height: Some(360),
                 ext: "mp4".to_owned(),
                 vcodec: Some("avc1".to_owned()),
                 acodec: Some("aac".to_owned()),
@@ -1095,7 +1116,7 @@ mod downloader_unit_tests {
             },
             Format {
                 format_id: "1080".to_owned(),
-                height: 1080,
+                height: Some(1080),
                 ext: "mp4".to_owned(),
                 vcodec: Some("avc1".to_owned()),
                 acodec: Some("aac".to_owned()),
@@ -1176,18 +1197,3 @@ mod downloader_unit_tests {
 //         println!("JQ execution failed");
 //     }
 // }
-
-#[derive(Debug, Deserialize, Serialize)]
-struct MediaMetadata {
-    title: String,
-    thumbnail: Option<String>,
-    formats: Vec<Format>,
-    entries: Option<Vec<MediaEntryMetadata>>,
-}
-
-#[derive(Debug, Deserialize, Serialize)]
-struct MediaEntryMetadata {
-    title: String,
-    thumbnail: String,
-    formats: Vec<Format>,
-}
