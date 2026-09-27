@@ -1,46 +1,36 @@
 use axum::{
     Router,
     body::Body,
-    extract::{Json, Query},
+    extract::{Json, Query, State},
     http::StatusCode,
     response::{Html, Response},
     routing::get,
 };
 use serde::{Deserialize, Serialize};
 use std::array::IntoIter;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 #[cfg(test)]
 use std::sync::{Mutex, OnceLock};
 use std::{
     collections::HashMap,
     io::{self, Write},
     process::{Command, Stdio},
-    sync::{LazyLock, RwLock},
+    sync::{Arc, RwLock},
 };
 use url::Url;
 
 const MAX_FORMAT_OPTIONS: usize = 10;
-const DEFAULT_DOWNLOADS_DIRECTORY: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/downloads");
-static DOWNLOADS_DIRECTORY: LazyLock<String> = LazyLock::new(|| {
-    dotenvy::dotenv().ok();
-    std::env::var("DOWNLOADS_DIRECTORY")
-        .ok()
-        .filter(|path| !path.is_empty())
-        .unwrap_or_else(|| DEFAULT_DOWNLOADS_DIRECTORY.to_owned())
-});
 const DEFAULT_ADDRESS: &str = "0.0.0.0:3424";
-
-static FORMATS_CACHE: LazyLock<RwLock<HashMap<String, Vec<Format>>>> =
-    LazyLock::new(|| RwLock::new(HashMap::new()));
 
 #[tokio::main]
 async fn main() -> Result<(), Error> {
-    ensure_directory_exists(&DOWNLOADS_DIRECTORY)?;
+    let state = AppState::from_environment()?;
     if std::env::args().nth(1).as_deref() == Some("server") {
-        return run_server(std::env::args().nth(2)).await;
+        let address = std::env::args().nth(2);
+        return run_server(state, address).await;
     }
 
-    run_cli().await
+    run_cli(&state).await
 }
 
 // Error and data types
@@ -53,6 +43,8 @@ enum Error {
     InvalidInput(String),
     IO(io::Error),
     UnsupportedPlatform(String),
+    NotAValidPath(String),
+    MissingArgument(String),
 }
 
 #[derive(Clone, Deserialize, Serialize, Debug)]
@@ -72,6 +64,60 @@ struct FormatResponse {
     filesize: Option<u64>,
 }
 
+#[derive(Clone, Debug)]
+struct Config {
+    instagram_cookies_path: PathBuf,
+    youtube_cookies_path: PathBuf,
+    downloads_directory: PathBuf,
+}
+
+struct AppState {
+    config: Config,
+    formats_cache: RwLock<HashMap<String, Vec<Format>>>,
+}
+
+impl AppState {
+    fn from_environment() -> Result<Self, Error> {
+        dotenvy::dotenv().ok();
+
+        let downloads_directory = environment_path("DOWNLOADS_DIRECTORY").or_else(|error| {
+            match error {
+                // Create the downloads directory only if it was not set in the environment variables
+                Error::MissingArgument(_) => {
+                    let path = PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/downloads"));
+                    std::fs::create_dir_all(&path).map_err(Error::IO)?;
+                    Ok(path)
+                },
+                // Otherwise, return the error
+                _ => return Err(error),
+            }
+        })?;
+
+        Ok(Self {
+            config: Config {
+                instagram_cookies_path: environment_path("INSTAGRAM_COOKIES_FILE")?,
+                youtube_cookies_path: environment_path("YOUTUBE_COOKIES_FILE")?,
+                downloads_directory,
+            },
+            formats_cache: RwLock::new(HashMap::new()),
+        })
+    }
+}
+
+/// Returns the path to the environment variable, or an error if it is not set or is not a valid path.
+fn environment_path(name: &str) -> Result<PathBuf, Error> {
+    std::env::var(name)
+        .map_err(|_| Error::MissingArgument(format!("{name} must be set in .env")))
+        .map(PathBuf::from)
+        .and_then(|path| {
+            if path.exists() { // Ensure the path set in the environment variables exists
+                Ok(path)
+            } else {
+                Err(Error::NotAValidPath(format!("{name} from the environment is not a valid path")))
+            }
+        })
+}
+
 impl From<Format> for FormatResponse {
     fn from(format: Format) -> Self {
         Self {
@@ -82,19 +128,9 @@ impl From<Format> for FormatResponse {
     }
 }
 
-fn ensure_directory_exists(path: &str) -> Result<(), Error> {
-    if !Path::new(path).exists() {
-        std::fs::create_dir_all(path).map_err(Error::IO)?;
-    }
-    Ok(())
-}
-
 /// Gets the download file name template. yt-dlp will substitute id and ext with the corresponding values for each file.
-fn get_download_file_path() -> String {
-    format!(
-        "{}/%(id)s.%(ext)s",
-        DOWNLOADS_DIRECTORY.trim_end_matches('/')
-    )
+fn get_download_file_path(config: &Config) -> PathBuf {
+    config.downloads_directory.join("%(id)s.%(ext)s")
 }
 
 impl Format {
@@ -213,9 +249,21 @@ trait PlatformDownloader {
         Ok(vec![Format::best()])
     }
 
-    fn download(&self, url: &str, _format_id: &str) -> Result<(), Error> {
+    fn download(
+        &self,
+        url: &str,
+        _format_id: &str,
+        config: &Config,
+        _formats_cache: &RwLock<HashMap<String, Vec<Format>>>,
+    ) -> Result<(), Error> {
         Command::new("yt-dlp")
-            .args(["-f", "best", "-o", get_download_file_path().as_str(), url])
+            .args([
+                "-f",
+                "best",
+                "-o",
+                get_download_file_path(config).to_string_lossy().as_ref(),
+                url,
+            ])
             .output()
             .map_err(|error| Error::YtDlpExecutionFailed(error.to_string()))?;
 
@@ -223,35 +271,23 @@ trait PlatformDownloader {
     }
 }
 
-struct YouTubeDownloader;
-
-impl YouTubeDownloader {
-    const COOKIES_FILE_PATH_ENV_KEY: &'static str = "YOUTUBE_COOKIES_FILE";
+struct YouTubeDownloader {
+    config: Config,
 }
-
 struct FacebookDownloader;
-struct InstagramDownloader;
-
-impl InstagramDownloader {
-    const COOKIES_FILE_PATH_ENV_KEY: &'static str = "INSTAGRAM_COOKIES_FILE";
+struct InstagramDownloader {
+    config: Config,
 }
-
 struct XDownloader;
 struct TikTokDownloader;
 
-fn get_cookies_file_path(name: &str) -> Result<String, Error> {
-    dotenvy::dotenv().ok();
-    std::env::var(name).map_err(|_| Error::InvalidInput(format!("{name} must be set in .env")))
-}
-
 impl PlatformDownloader for YouTubeDownloader {
     fn list_formats(&self, url: &str) -> Result<Vec<Format>, Error> {
-        let cookies_file_path = get_cookies_file_path(Self::COOKIES_FILE_PATH_ENV_KEY)?;
         let video_details = Command::new("yt-dlp")
             .arg("--dump-single-json")
             .arg("--skip-download")
             .arg("--cookies")
-            .arg(cookies_file_path)
+            .arg(&self.config.youtube_cookies_path)
             .arg(url)
             .stdout(Stdio::piped())
             .spawn()
@@ -274,8 +310,14 @@ impl PlatformDownloader for YouTubeDownloader {
             .collect())
     }
 
-    fn download(&self, url: &str, format_id: &str) -> Result<(), Error> {
-        let formats = FORMATS_CACHE
+    fn download(
+        &self,
+        url: &str,
+        format_id: &str,
+        _config: &Config,
+        formats_cache: &RwLock<HashMap<String, Vec<Format>>>,
+    ) -> Result<(), Error> {
+        let formats = formats_cache
             .read()
             .map_err(|error| Error::InvalidInput(format!("Format cache unavailable: {error}")))?
             .get(url)
@@ -288,8 +330,6 @@ impl PlatformDownloader for YouTubeDownloader {
             )));
         }
 
-        let cookies_file_path = get_cookies_file_path(Self::COOKIES_FILE_PATH_ENV_KEY)?;
-
         Command::new("yt-dlp")
             .args([
                 "-f",
@@ -297,9 +337,11 @@ impl PlatformDownloader for YouTubeDownloader {
                 "--merge-output-format",
                 "mp4",
                 "--cookies",
-                &cookies_file_path,
+                self.config.youtube_cookies_path.to_string_lossy().as_ref(),
                 "-o",
-                get_download_file_path().as_str(),
+                get_download_file_path(&self.config)
+                    .to_string_lossy()
+                    .as_ref(),
                 url,
             ])
             .output()
@@ -320,17 +362,26 @@ impl PlatformDownloader for YouTubeDownloader {
 
 impl PlatformDownloader for FacebookDownloader {}
 impl PlatformDownloader for InstagramDownloader {
-    fn download(&self, url: &str, _format_id: &str) -> Result<(), Error> {
-        let cookies_file_path = get_cookies_file_path(Self::COOKIES_FILE_PATH_ENV_KEY)?;
-
+    fn download(
+        &self,
+        url: &str,
+        _format_id: &str,
+        _config: &Config,
+        _formats_cache: &RwLock<HashMap<String, Vec<Format>>>,
+    ) -> Result<(), Error> {
         Command::new("yt-dlp")
             .args([
                 "-f",
                 "best",
                 "--cookies",
-                &cookies_file_path,
+                self.config
+                    .instagram_cookies_path
+                    .to_string_lossy()
+                    .as_ref(),
                 "-o",
-                get_download_file_path().as_str(),
+                get_download_file_path(&self.config)
+                    .to_string_lossy()
+                    .as_ref(),
                 url,
             ])
             .output()
@@ -344,10 +395,10 @@ impl PlatformDownloader for TikTokDownloader {}
 
 // Interactive CLI
 
-async fn run_cli() -> Result<(), Error> {
+async fn run_cli(state: &AppState) -> Result<(), Error> {
     let url = prompt("URL: ")?;
 
-    let formats = list_formats(&url).await?;
+    let formats = list_formats(&url, &state.config).await?;
 
     for (index, format) in formats.iter().enumerate() {
         println!(
@@ -369,7 +420,7 @@ async fn run_cli() -> Result<(), Error> {
 
     let format = select_format(&formats, &choice)?;
 
-    download_video(&url, &format.format_id).await?;
+    download_video(&url, &format.format_id, state).await?;
 
     println!("Download complete!");
 
@@ -390,12 +441,12 @@ fn select_format<'a>(formats: &'a [Format], choice: &str) -> Result<&'a Format, 
 
 // Axum API
 
-async fn run_server(address: Option<String>) -> Result<(), Error> {
+async fn run_server(state: AppState, address: Option<String>) -> Result<(), Error> {
     let address = address.unwrap_or_else(|| DEFAULT_ADDRESS.to_owned());
     let listener = tokio::net::TcpListener::bind(&address)
         .await
         .map_err(Error::IO)?;
-    let app = api_router();
+    let app = api_router(Arc::new(state));
 
     println!("Axum server listening on http://{address}");
     axum::serve(listener, app)
@@ -403,11 +454,12 @@ async fn run_server(address: Option<String>) -> Result<(), Error> {
         .map_err(|error| Error::IO(io::Error::other(error)))
 }
 
-fn api_router() -> Router {
+fn api_router(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/ui", get(ui_handler))
         .route("/formats", get(list_formats_handler))
         .route("/download", get(download_handler))
+        .with_state(state)
 }
 
 async fn ui_handler() -> Html<&'static str> {
@@ -415,16 +467,18 @@ async fn ui_handler() -> Html<&'static str> {
 }
 
 async fn list_formats_handler(
+    State(state): State<Arc<AppState>>,
     Query(request): Query<FormatsRequest>,
 ) -> Result<Json<Vec<FormatResponse>>, (StatusCode, String)> {
     println!("Received formats request for URL: {}", request.url);
-    cached_list_formats(&request.url)
+    cached_list_formats(&request.url, &state)
         .await
         .map(|formats| Json(formats.into_iter().map(FormatResponse::from).collect()))
         .map_err(api_error)
 }
 
 async fn download_handler(
+    State(state): State<Arc<AppState>>,
     Query(request): Query<DownloadRequest>,
 ) -> Result<Response<Body>, (StatusCode, String)> {
     println!(
@@ -432,7 +486,7 @@ async fn download_handler(
         request.url, request.format_id, request.keep_on_server
     );
     if request.keep_on_server {
-        download_video(&request.url, &request.format_id)
+        download_video(&request.url, &request.format_id, &state)
             .await
             .map(|()| {
                 Response::builder()
@@ -442,7 +496,7 @@ async fn download_handler(
             })
             .map_err(api_error)
     } else {
-        download_for_client(&request.url, &request.format_id)
+        download_for_client(&request.url, &request.format_id, &state)
             .await
             .map(|(body, filename)| {
                 Response::builder()
@@ -458,8 +512,9 @@ async fn download_handler(
     }
 }
 
-async fn cached_list_formats(url: &str) -> Result<Vec<Format>, Error> {
-    if let Some(formats) = FORMATS_CACHE
+async fn cached_list_formats(url: &str, state: &AppState) -> Result<Vec<Format>, Error> {
+    if let Some(formats) = state
+        .formats_cache
         .read()
         .map_err(|error| Error::InvalidInput(format!("Format cache unavailable: {error}")))?
         .get(url)
@@ -468,8 +523,9 @@ async fn cached_list_formats(url: &str) -> Result<Vec<Format>, Error> {
         return Ok(formats);
     }
 
-    let formats = list_formats(url).await?;
-    FORMATS_CACHE
+    let formats = list_formats(url, &state.config).await?;
+    state
+        .formats_cache
         .write()
         .map_err(|error| Error::InvalidInput(format!("Format cache unavailable: {error}")))?
         .insert(url.to_owned(), formats.clone());
@@ -520,29 +576,42 @@ fn get_platform_from_url(url: &str) -> Result<Platform, Error> {
     }
 }
 
-fn downloader_for_url(url: &str) -> Result<Box<dyn PlatformDownloader>, Error> {
+fn downloader_for_url(url: &str, config: &Config) -> Result<Box<dyn PlatformDownloader>, Error> {
     match get_platform_from_url(url)? {
-        Platform::YouTube => Ok(Box::new(YouTubeDownloader)),
+        Platform::YouTube => Ok(Box::new(YouTubeDownloader {
+            config: config.clone(),
+        })),
         Platform::Facebook => Ok(Box::new(FacebookDownloader)),
-        Platform::Instagram => Ok(Box::new(InstagramDownloader)),
+        Platform::Instagram => Ok(Box::new(InstagramDownloader {
+            config: config.clone(),
+        })),
         Platform::X => Ok(Box::new(XDownloader)),
         Platform::TikTok => Ok(Box::new(TikTokDownloader)),
         Platform::Unsupported(host) => Err(Error::UnsupportedPlatform(host)),
     }
 }
 
-async fn list_formats(url: &str) -> Result<Vec<Format>, Error> {
-    downloader_for_url(url)?.list_formats(url)
+async fn list_formats(url: &str, config: &Config) -> Result<Vec<Format>, Error> {
+    downloader_for_url(url, config)?.list_formats(url)
 }
 
-async fn download_video(url: &str, format_id: &str) -> Result<(), Error> {
-    downloader_for_url(url)?.download(url, format_id)
+async fn download_video(url: &str, format_id: &str, state: &AppState) -> Result<(), Error> {
+    downloader_for_url(url, &state.config)?.download(
+        url,
+        format_id,
+        &state.config,
+        &state.formats_cache,
+    )
 }
 
-async fn download_for_client(url: &str, format_id: &str) -> Result<(Body, String), Error> {
-    download_video(url, format_id).await?;
+async fn download_for_client(
+    url: &str,
+    format_id: &str,
+    state: &AppState,
+) -> Result<(Body, String), Error> {
+    download_video(url, format_id, state).await?;
 
-    let path = std::fs::read_dir(DOWNLOADS_DIRECTORY.as_str())
+    let path = std::fs::read_dir(&state.config.downloads_directory)
         .map_err(Error::IO)?
         .filter_map(Result::ok)
         .filter(|entry| entry.path().is_file())
@@ -577,20 +646,32 @@ fn get_env_variable(name: &str) -> String {
 }
 
 #[cfg(test)]
+fn test_state() -> AppState {
+    AppState::from_environment().expect("test configuration should be available")
+}
+
+#[cfg(test)]
 mod api_tests {
     use super::*;
     use std::path::Path;
 
     fn cleanup_download() {
-        let path = Path::new(DOWNLOADS_DIRECTORY.as_str()).join("foO1QakhjZE.mp4");
+        let path = test_state()
+            .config
+            .downloads_directory
+            .join("foO1QakhjZE.mp4");
         let _ = std::fs::remove_file(path);
     }
 
     #[tokio::test]
     async fn formats_endpoint_returns_default_format_for_supported_fallback_platform() {
-        let response = list_formats_handler(Query(FormatsRequest {
-            url: get_env_variable("FACEBOOK_TEST_URL"),
-        }))
+        let state = Arc::new(test_state());
+        let response = list_formats_handler(
+            State(state),
+            Query(FormatsRequest {
+                url: get_env_variable("FACEBOOK_TEST_URL"),
+            }),
+        )
         .await
         .unwrap()
         .0;
@@ -601,9 +682,13 @@ mod api_tests {
 
     #[tokio::test]
     async fn formats_endpoint_rejects_invalid_url() {
-        let error = list_formats_handler(Query(FormatsRequest {
-            url: "not-a-url".to_owned(),
-        }))
+        let state = Arc::new(test_state());
+        let error = list_formats_handler(
+            State(state),
+            Query(FormatsRequest {
+                url: "not-a-url".to_owned(),
+            }),
+        )
         .await
         .unwrap_err();
 
@@ -618,10 +703,14 @@ mod api_tests {
             .unwrap();
         cleanup_download();
 
+        let state = Arc::new(test_state());
         let youtube_url = get_env_variable("YOUTUBE_TEST_URL");
-        let formats = list_formats_handler(Query(FormatsRequest {
-            url: youtube_url.clone(),
-        }))
+        let formats = list_formats_handler(
+            State(Arc::clone(&state)),
+            Query(FormatsRequest {
+                url: youtube_url.clone(),
+            }),
+        )
         .await
         .unwrap()
         .0;
@@ -629,17 +718,20 @@ mod api_tests {
             .first()
             .expect("YouTube formats should not be empty");
 
-        let response = download_handler(Query(DownloadRequest {
-            url: youtube_url,
-            format_id: lowest_format.format_id.clone(),
-            keep_on_server: true,
-        }))
+        let response = download_handler(
+            State(state),
+            Query(DownloadRequest {
+                url: youtube_url,
+                format_id: lowest_format.format_id.clone(),
+                keep_on_server: true,
+            }),
+        )
         .await
         .unwrap();
 
         assert_eq!(response.status(), StatusCode::NO_CONTENT);
         assert!(
-            Path::new(DOWNLOADS_DIRECTORY.as_str())
+            Path::new(&test_state().config.downloads_directory)
                 .join("foO1QakhjZE.mp4")
                 .exists()
         );
@@ -654,17 +746,21 @@ mod api_tests {
             .unwrap();
         cleanup_download();
 
+        let state = Arc::new(test_state());
         let youtube_url = get_env_variable("YOUTUBE_TEST_URL");
-        let formats = list_formats(&youtube_url).await.unwrap();
+        let formats = list_formats(&youtube_url, &state.config).await.unwrap();
         let lowest_format = formats
             .first()
             .expect("YouTube formats should not be empty");
 
-        let response = download_handler(Query(DownloadRequest {
-            url: youtube_url,
-            format_id: lowest_format.format_id.clone(),
-            keep_on_server: false,
-        }))
+        let response = download_handler(
+            State(state),
+            Query(DownloadRequest {
+                url: youtube_url,
+                format_id: lowest_format.format_id.clone(),
+                keep_on_server: false,
+            }),
+        )
         .await
         .unwrap();
 
@@ -672,7 +768,7 @@ mod api_tests {
         assert_eq!(response.headers().get("content-type").unwrap(), "video/mp4");
         assert!(response.headers().contains_key("content-disposition"));
         assert!(
-            !Path::new(DOWNLOADS_DIRECTORY.as_str())
+            !Path::new(&test_state().config.downloads_directory)
                 .join("foO1QakhjZE.mp4")
                 .exists()
         );
@@ -680,7 +776,7 @@ mod api_tests {
 
     #[test]
     fn router_exposes_api_routes() {
-        let _router = api_router();
+        let _router = api_router(Arc::new(test_state()));
     }
 
     #[tokio::test]
@@ -717,7 +813,10 @@ mod cli_tests {
     use std::path::Path;
 
     fn cleanup_download() {
-        let path = Path::new(DOWNLOADS_DIRECTORY.as_str()).join("foO1QakhjZE.mp4");
+        let path = test_state()
+            .config
+            .downloads_directory
+            .join("foO1QakhjZE.mp4");
         let _ = std::fs::remove_file(path);
     }
 
@@ -761,18 +860,19 @@ mod cli_tests {
             .unwrap();
         cleanup_download();
 
+        let state = test_state();
         let youtube_url = get_env_variable("YOUTUBE_TEST_URL");
-        let formats = list_formats(&youtube_url).await.unwrap();
+        let formats = list_formats(&youtube_url, &state.config).await.unwrap();
         let lowest_format = formats
             .first()
             .expect("YouTube formats should not be empty");
 
-        download_video(&youtube_url, &lowest_format.format_id)
+        download_video(&youtube_url, &lowest_format.format_id, &state)
             .await
             .unwrap();
 
         assert!(
-            Path::new(DOWNLOADS_DIRECTORY.as_str())
+            Path::new(&state.config.downloads_directory)
                 .join("foO1QakhjZE.mp4")
                 .exists()
         );
