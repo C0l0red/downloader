@@ -14,7 +14,7 @@ use std::sync::{Mutex, OnceLock};
 use std::{
     collections::HashMap,
     io::{self, Write},
-    process::{Command, Stdio},
+    process::Command,
     sync::{Arc, RwLock},
 };
 use url::Url;
@@ -46,7 +46,6 @@ async fn run() -> Result<(), Error> {
 #[derive(Debug)]
 enum Error {
     YtDlpExecutionFailed(String),
-    JqExecutionFailed(String),
     FormatDeserializationFailed(String),
     InvalidInput(String),
     IO(io::Error),
@@ -72,10 +71,6 @@ impl IntoResponse for Error {
             Self::YtDlpExecutionFailed(_) => (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "An error occurred while downloading or getting metadata for the media".to_owned(),
-            ),
-            Self::JqExecutionFailed(_) => (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "An error occurred while reading the media formats".to_owned(),
             ),
             Self::FormatDeserializationFailed(_) => (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -305,6 +300,124 @@ struct DownloadRequest {
     keep_on_server: bool,
 }
 
+// yt-dlp wrapper
+
+struct YtDlp {
+    url: String,
+    format_id: Option<String>,
+    cookies_path: Option<PathBuf>,
+    output_path: Option<PathBuf>,
+    merge_mp4: bool,
+}
+
+#[derive(Default)]
+struct YtDlpBuilder {
+    url: Option<String>,
+    format_id: Option<String>,
+    cookies_path: Option<PathBuf>,
+    output_path: Option<PathBuf>,
+    merge_mp4: bool,
+}
+
+impl YtDlpBuilder {
+    fn new() -> Self {
+        Self::default()
+    }
+
+    fn url(mut self, url: impl Into<String>) -> Self {
+        self.url = Some(url.into());
+        self
+    }
+
+    fn format_id(mut self, format_id: impl Into<String>) -> Self {
+        self.format_id = Some(format_id.into());
+        self
+    }
+
+    fn cookies_path(mut self, path: impl Into<PathBuf>) -> Self {
+        self.cookies_path = Some(path.into());
+        self
+    }
+
+    fn output_path(mut self, path: impl Into<PathBuf>) -> Self {
+        self.output_path = Some(path.into());
+        self
+    }
+
+    fn merge_mp4(mut self) -> Self {
+        self.merge_mp4 = true;
+        self
+    }
+
+    fn build(self) -> Result<YtDlp, Error> {
+        Ok(YtDlp {
+            url: self.url.ok_or_else(|| {
+                Error::Internal("Building the yt-dlp request failed: URL is missing".to_owned())
+            })?,
+            format_id: self.format_id,
+            cookies_path: self.cookies_path,
+            output_path: self.output_path,
+            merge_mp4: self.merge_mp4,
+        })
+    }
+}
+
+impl YtDlp {
+    fn get_metadata(&self) -> Result<serde_json::Value, Error> {
+        let mut command = Command::new("yt-dlp");
+        command.args(["--dump-single-json", "--skip-download"]);
+        self.add_cookies(&mut command);
+        command.arg(&self.url);
+
+        let output = Self::execute(&mut command)?;
+        serde_json::from_slice(&output.stdout)
+            .map_err(|error| Error::FormatDeserializationFailed(error.to_string()))
+    }
+
+    fn download_media(&self) -> Result<(), Error> {
+        let output_path = self.output_path.as_ref().ok_or_else(|| {
+            Error::Internal(
+                "Building the yt-dlp download failed: output path is missing".to_owned(),
+            )
+        })?;
+        let format = self
+            .format_id
+            .as_deref()
+            .map(|format_id| format_id.to_owned() + "+ba")
+            .unwrap_or_else(|| "best".to_owned());
+
+        let mut command = Command::new("yt-dlp");
+        command.args(["-f", &format]);
+        if self.merge_mp4 {
+            command.args(["--merge-output-format", "mp4"]);
+        }
+        self.add_cookies(&mut command);
+        command.args(["-o", output_path.to_string_lossy().as_ref(), &self.url]);
+        Self::execute(&mut command).map(|_| ())
+    }
+
+    fn add_cookies(&self, command: &mut Command) {
+        if let Some(path) = &self.cookies_path {
+            command.args(["--cookies", path.to_string_lossy().as_ref()]);
+        }
+    }
+
+    fn execute(command: &mut Command) -> Result<std::process::Output, Error> {
+        command
+            .output()
+            .map_err(|error| Error::YtDlpExecutionFailed(error.to_string()))
+            .and_then(|output| {
+                if output.status.success() {
+                    Ok(output)
+                } else {
+                    Err(Error::YtDlpExecutionFailed(
+                        String::from_utf8_lossy(&output.stderr).into_owned(),
+                    ))
+                }
+            })
+    }
+}
+
 // Platform downloaders
 
 trait PlatformDownloader {
@@ -319,27 +432,11 @@ trait PlatformDownloader {
         config: &Config,
         _formats_cache: &RwLock<HashMap<String, Vec<Format>>>,
     ) -> Result<(), Error> {
-        Command::new("yt-dlp")
-            .args([
-                "-f",
-                "best",
-                "-o",
-                get_download_file_path(config).to_string_lossy().as_ref(),
-                url,
-            ])
-            .output()
-            .map_err(|error| Error::YtDlpExecutionFailed(error.to_string()))
-            .and_then(|output| {
-                if output.status.success() {
-                    Ok(output)
-                } else {
-                    Err(Error::YtDlpExecutionFailed(
-                        String::from_utf8_lossy(&output.stderr).into_owned(),
-                    ))
-                }
-            })?;
-
-        Ok(())
+        YtDlpBuilder::new()
+            .url(url)
+            .output_path(get_download_file_path(config))
+            .build()?
+            .download_media()
     }
 }
 
@@ -355,23 +452,25 @@ struct TikTokDownloader;
 
 impl PlatformDownloader for YouTubeDownloader {
     fn list_formats(&self, url: &str) -> Result<Vec<Format>, Error> {
-        let video_details = Command::new("yt-dlp")
-            .arg("--dump-single-json")
-            .arg("--skip-download")
-            .arg("--cookies")
-            .arg(&self.config.youtube_cookies_path)
-            .arg(url)
-            .stdout(Stdio::piped())
-            .spawn()
-            .map_err(|error| Error::YtDlpExecutionFailed(error.to_string()))?;
-
-        let formats_bytes = Command::new("jq")
-            .arg(r#"[.formats[] | select(.vcodec != "none" and .height != null) | {format_id, height, ext, vcodec, acodec, filesize}]"#)
-            .stdin(video_details.stdout.ok_or_else(|| Error::JqExecutionFailed("Failed to read output from yt-dlp result".to_string()))?)
-            .output()
-            .map_err(|error| Error::JqExecutionFailed(error.to_string()))?;
-
-        let formats: Vec<Format> = serde_json::from_slice(&formats_bytes.stdout)
+        let metadata = YtDlpBuilder::new()
+            .url(url)
+            .cookies_path(self.config.youtube_cookies_path.clone())
+            .build()?
+            .get_metadata()?;
+        let formats = metadata
+            .get("formats")
+            .and_then(serde_json::Value::as_array)
+            .ok_or_else(|| {
+                Error::FormatDeserializationFailed("Missing formats metadata".to_owned())
+            })?
+            .iter()
+            .filter(|format| {
+                format.get("vcodec").and_then(serde_json::Value::as_str) != Some("none")
+                    && format.get("height").is_some_and(|height| !height.is_null())
+            })
+            .cloned()
+            .map(serde_json::from_value)
+            .collect::<Result<Vec<Format>, _>>()
             .map_err(|error| Error::FormatDeserializationFailed(error.to_string()))?;
 
         // Filter out formats incompatible with iPhone
@@ -402,33 +501,14 @@ impl PlatformDownloader for YouTubeDownloader {
             )));
         }
 
-        Command::new("yt-dlp")
-            .args([
-                "-f",
-                &format!("{format_id}+ba"),
-                "--merge-output-format",
-                "mp4",
-                "--cookies",
-                self.config.youtube_cookies_path.to_string_lossy().as_ref(),
-                "-o",
-                get_download_file_path(&self.config)
-                    .to_string_lossy()
-                    .as_ref(),
-                url,
-            ])
-            .output()
-            .map_err(|error| Error::YtDlpExecutionFailed(error.to_string()))
-            .and_then(|output| {
-                if output.status.success() {
-                    Ok(output)
-                } else {
-                    Err(Error::YtDlpExecutionFailed(
-                        String::from_utf8_lossy(&output.stderr).into_owned(),
-                    ))
-                }
-            })?;
-
-        Ok(())
+        YtDlpBuilder::new()
+            .url(url)
+            .format_id(format_id)
+            .cookies_path(self.config.youtube_cookies_path.clone())
+            .output_path(get_download_file_path(&self.config))
+            .merge_mp4()
+            .build()?
+            .download_media()
     }
 }
 
@@ -441,34 +521,12 @@ impl PlatformDownloader for InstagramDownloader {
         _config: &Config,
         _formats_cache: &RwLock<HashMap<String, Vec<Format>>>,
     ) -> Result<(), Error> {
-        Command::new("yt-dlp")
-            .args([
-                "-f",
-                "best",
-                "--cookies",
-                self.config
-                    .instagram_cookies_path
-                    .to_string_lossy()
-                    .as_ref(),
-                "-o",
-                get_download_file_path(&self.config)
-                    .to_string_lossy()
-                    .as_ref(),
-                url,
-            ])
-            .output()
-            .map_err(|error| Error::YtDlpExecutionFailed(error.to_string()))
-            .and_then(|output| {
-                if output.status.success() {
-                    Ok(output)
-                } else {
-                    Err(Error::YtDlpExecutionFailed(
-                        String::from_utf8_lossy(&output.stderr).into_owned(),
-                    ))
-                }
-            })?;
-
-        Ok(())
+        YtDlpBuilder::new()
+            .url(url)
+            .cookies_path(self.config.instagram_cookies_path.clone())
+            .output_path(get_download_file_path(&self.config))
+            .build()?
+            .download_media()
     }
 }
 impl PlatformDownloader for XDownloader {}
@@ -1061,63 +1119,63 @@ mod downloader_unit_tests {
     }
 }
 
-#[test]
-fn test_command() {
-    let video_details = Command::new("yt-dlp")
-        .arg("--dump-single-json")
-        .arg("--skip-download")
-        .arg("--cookies")
-        // .arg("cookies/instagram-cookies.txt")
-        .arg("cookies/youtube-cookies.txt")
-        // .arg("https://www.instagram.com/stories/fhavur8/3995189932905526257?utm_source=ig_story_item_share&stkn=MW9xaTMydDlvaHVzMQ==")
-        .arg("https://youtu.be/foO1QakhjZE?si=tRel8JwJ_kmZJoul")
-        .stdout(Stdio::piped())
-        .spawn()
-        .map_err(|error| Error::YtDlpExecutionFailed(error.to_string()))
-        .unwrap();
-
-    let formats_bytes = Command::new("jq")
-        // .arg(r#"[.formats[] | select(.vcodec != "none" and .height != null) | {format_id, height, ext, vcodec, acodec, filesize}]"#)
-        .arg(
-            r#"
-        {
-          title,
-          thumbnail,
-          is_playlist: (.entries != null),
-          item_count: (if .entries then (.entries | length) else 1 end),
-          formats: [
-            .formats[]?
-            | select(.vcodec != "none" and .height != null)
-            | {format_id, height, ext, vcodec, acodec, filesize}
-          ],
-          entries: [
-            .entries[]? | {
-                title,
-                thumbnail,
-                formats: [
-                    .formats[]
-                    | select(.vcodec != "none" and .height != null)
-                    | {format_id, height, ext, vcodec, acodec, filesize}
-                ]
-            }
-          ]
-        }
-        "#,
-        )
-        .stdin(video_details.stdout.unwrap())
-        .output()
-        .map_err(|error| Error::JqExecutionFailed(error.to_string()))
-        .unwrap();
-
-    if formats_bytes.status.success() {
-        let formats_string = String::from_utf8(formats_bytes.stdout).unwrap();
-        // println!("As a string: {formats_string}");
-        let media_metadata: MediaMetadata = serde_json::from_str(&formats_string).unwrap();
-        println!("{}", serde_json::to_string_pretty(&media_metadata).unwrap());
-    } else {
-        println!("JQ execution failed");
-    }
-}
+// #[test]
+// fn test_command() {
+//     let video_details = Command::new("yt-dlp")
+//         .arg("--dump-single-json")
+//         .arg("--skip-download")
+//         .arg("--cookies")
+//         // .arg("cookies/instagram-cookies.txt")
+//         .arg("cookies/youtube-cookies.txt")
+//         // .arg("https://www.instagram.com/stories/fhavur8/3995189932905526257?utm_source=ig_story_item_share&stkn=MW9xaTMydDlvaHVzMQ==")
+//         .arg("https://youtu.be/foO1QakhjZE?si=tRel8JwJ_kmZJoul")
+//         .stdout(Stdio::piped())
+//         .spawn()
+//         .map_err(|error| Error::YtDlpExecutionFailed(error.to_string()))
+//         .unwrap();
+//
+//     let formats_bytes = Command::new("jq")
+//         // .arg(r#"[.formats[] | select(.vcodec != "none" and .height != null) | {format_id, height, ext, vcodec, acodec, filesize}]"#)
+//         .arg(
+//             r#"
+//         {
+//           title,
+//           thumbnail,
+//           is_playlist: (.entries != null),
+//           item_count: (if .entries then (.entries | length) else 1 end),
+//           formats: [
+//             .formats[]?
+//             | select(.vcodec != "none" and .height != null)
+//             | {format_id, height, ext, vcodec, acodec, filesize}
+//           ],
+//           entries: [
+//             .entries[]? | {
+//                 title,
+//                 thumbnail,
+//                 formats: [
+//                     .formats[]
+//                     | select(.vcodec != "none" and .height != null)
+//                     | {format_id, height, ext, vcodec, acodec, filesize}
+//                 ]
+//             }
+//           ]
+//         }
+//         "#,
+//         )
+//         .stdin(video_details.stdout.unwrap())
+//         .output()
+//         .map_err(|error| Error::JqExecutionFailed(error.to_string()))
+//         .unwrap();
+//
+//     if formats_bytes.status.success() {
+//         let formats_string = String::from_utf8(formats_bytes.stdout).unwrap();
+//         // println!("As a string: {formats_string}");
+//         let media_metadata: MediaMetadata = serde_json::from_str(&formats_string).unwrap();
+//         println!("{}", serde_json::to_string_pretty(&media_metadata).unwrap());
+//     } else {
+//         println!("JQ execution failed");
+//     }
+// }
 
 #[derive(Debug, Deserialize, Serialize)]
 struct MediaMetadata {
