@@ -84,10 +84,13 @@ impl AppState {
             match error {
                 // Create the downloads directory only if it was not set in the environment variables
                 Error::MissingArgument(_) => {
-                    let path = PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/downloads"));
+                    let current_directory = std::env::current_dir().map_err(Error::IO)?;
+                    let path = PathBuf::from(current_directory.join("downloads"));
+
+                    println!("DOWNLOADS_DIRECTORY environment variable not set, using {} as the downloads directory", path.display());
                     std::fs::create_dir_all(&path).map_err(Error::IO)?;
                     Ok(path)
-                },
+                }
                 // Otherwise, return the error
                 _ => return Err(error),
             }
@@ -110,10 +113,13 @@ fn environment_path(name: &str) -> Result<PathBuf, Error> {
         .map_err(|_| Error::MissingArgument(format!("{name} must be set in .env")))
         .map(PathBuf::from)
         .and_then(|path| {
-            if path.exists() { // Ensure the path set in the environment variables exists
+            if path.exists() {
+                // Ensure the path set in the environment variables exists
                 Ok(path)
             } else {
-                Err(Error::NotAValidPath(format!("{name} from the environment is not a valid path")))
+                Err(Error::NotAValidPath(format!(
+                    "{name} from the environment is not a valid path"
+                )))
             }
         })
 }
