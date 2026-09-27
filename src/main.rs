@@ -8,7 +8,7 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use std::array::IntoIter;
-use std::path::{Path, PathBuf};
+use std::path::{PathBuf};
 #[cfg(test)]
 use std::sync::{Mutex, OnceLock};
 use std::{
@@ -52,8 +52,8 @@ struct Format {
     format_id: String,
     height: u16,
     ext: String,
-    vcodec: String,
-    acodec: String,
+    vcodec: Option<String>,
+    acodec: Option<String>,
     filesize: Option<u64>,
 }
 
@@ -145,8 +145,8 @@ impl Format {
             format_id: "best".to_owned(),
             height: 0,
             ext: String::new(),
-            vcodec: String::new(),
-            acodec: String::new(),
+            vcodec: None,
+            acodec: None,
             filesize: None,
         }
     }
@@ -231,7 +231,7 @@ struct IsIphoneCompatible;
 
 impl FormatPredicate for IsIphoneCompatible {
     fn matches(&self, format: &Format) -> bool {
-        format.ext == "mp4" && format.vcodec.starts_with("avc1")
+        format.ext == "mp4" && format.vcodec.as_ref().is_some_and(|vcodec| vcodec.starts_with("avc1"))
     }
 }
 
@@ -301,7 +301,7 @@ impl PlatformDownloader for YouTubeDownloader {
 
         let formats_bytes = Command::new("jq")
             .arg(r#"[.formats[] | select(.vcodec != "none" and .height != null) | {format_id, height, ext, vcodec, acodec, filesize}]"#)
-            .stdin(video_details.stdout.unwrap())
+            .stdin(video_details.stdout.ok_or_else(|| Error::JqExecutionFailed("Failed to read output from yt-dlp result".to_string()))?)
             .output()
             .map_err(|error| Error::JqExecutionFailed(error.to_string()))?;
 
@@ -454,7 +454,7 @@ async fn run_server(state: AppState, address: Option<String>) -> Result<(), Erro
         .map_err(Error::IO)?;
     let app = api_router(Arc::new(state));
 
-    println!("Axum server listening on http://{address}");
+    println!("Axum server listening on {address}");
     axum::serve(listener, app)
         .await
         .map_err(|error| Error::IO(io::Error::other(error)))
@@ -831,8 +831,8 @@ mod cli_tests {
             format_id: format_id.to_owned(),
             height: 360,
             ext: "mp4".to_owned(),
-            vcodec: "h264".to_owned(),
-            acodec: "aac".to_owned(),
+            vcodec: Some("h264".to_owned()),
+            acodec: Some("aac".to_owned()),
             filesize: None,
         }
     }
@@ -927,24 +927,24 @@ mod downloader_unit_tests {
                 format_id: "144".to_owned(),
                 height: 144,
                 ext: "mp4".to_owned(),
-                vcodec: "avc1".to_owned(),
-                acodec: "aac".to_owned(),
+                vcodec: Some("avc1".to_owned()),
+                acodec: Some("aac".to_owned()),
                 filesize: None,
             },
             Format {
                 format_id: "360".to_owned(),
                 height: 360,
                 ext: "mp4".to_owned(),
-                vcodec: "avc1".to_owned(),
-                acodec: "aac".to_owned(),
+                vcodec: Some("avc1".to_owned()),
+                acodec: Some("aac".to_owned()),
                 filesize: None,
             },
             Format {
                 format_id: "1080".to_owned(),
                 height: 1080,
                 ext: "mp4".to_owned(),
-                vcodec: "avc1".to_owned(),
-                acodec: "aac".to_owned(),
+                vcodec: Some("avc1".to_owned()),
+                acodec: Some("aac".to_owned()),
                 filesize: None,
             },
         ];
@@ -963,4 +963,73 @@ mod downloader_unit_tests {
             ["144", "360", "1080"]
         );
     }
+}
+
+#[test]
+fn test_command() {
+    let video_details = Command::new("yt-dlp")
+        .arg("--dump-single-json")
+        .arg("--skip-download")
+        .arg("--cookies")
+        // .arg("cookies/instagram-cookies.txt")
+        .arg("cookies/youtube-cookies.txt")
+        // .arg("https://www.instagram.com/stories/fhavur8/3995189932905526257?utm_source=ig_story_item_share&stkn=MW9xaTMydDlvaHVzMQ==")
+        .arg("https://youtu.be/foO1QakhjZE?si=tRel8JwJ_kmZJoul")
+        .stdout(Stdio::piped())
+        .spawn()
+        .map_err(|error| Error::YtDlpExecutionFailed(error.to_string())).unwrap();
+
+    let formats_bytes = Command::new("jq")
+        // .arg(r#"[.formats[] | select(.vcodec != "none" and .height != null) | {format_id, height, ext, vcodec, acodec, filesize}]"#)
+        .arg(r#"
+        {
+          title,
+          thumbnail,
+          is_playlist: (.entries != null),
+          item_count: (if .entries then (.entries | length) else 1 end),
+          formats: [
+            .formats[]?
+            | select(.vcodec != "none" and .height != null)
+            | {format_id, height, ext, vcodec, acodec, filesize}
+          ],
+          entries: [
+            .entries[]? | {
+                title,
+                thumbnail,
+                formats: [
+                    .formats[]
+                    | select(.vcodec != "none" and .height != null)
+                    | {format_id, height, ext, vcodec, acodec, filesize}
+                ]
+            }
+          ]
+        }
+        "#)
+        .stdin(video_details.stdout.unwrap())
+        .output()
+        .map_err(|error| Error::JqExecutionFailed(error.to_string())).unwrap();
+
+    if formats_bytes.status.success() {
+        let formats_string = String::from_utf8(formats_bytes.stdout).unwrap();
+        // println!("As a string: {formats_string}");
+        let media_metadata: MediaMetadata = serde_json::from_str(&formats_string).unwrap();
+        println!("{}", serde_json::to_string_pretty(&media_metadata).unwrap());
+    } else {
+        println!("JQ execution failed");
+    }
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct MediaMetadata {
+    title: String,
+    thumbnail: Option<String>,
+    formats: Vec<Format>,
+    entries: Option<Vec<MediaEntryMetadata>>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct MediaEntryMetadata {
+    title: String,
+    thumbnail: String,
+    formats: Vec<Format>,
 }
