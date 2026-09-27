@@ -27,7 +27,6 @@ static DOWNLOADS_DIRECTORY: LazyLock<String> = LazyLock::new(|| {
         .ok()
         .filter(|path| !path.is_empty())
         .unwrap_or_else(|| DEFAULT_DOWNLOADS_DIRECTORY.to_owned())
-
 });
 const DEFAULT_ADDRESS: &str = "0.0.0.0:3424";
 
@@ -59,18 +58,32 @@ enum Error {
 #[derive(Clone, Deserialize, Serialize, Debug)]
 struct Format {
     format_id: String,
-    #[serde(skip_serializing_if = "is_zero")]
     height: u16,
-    #[serde(skip_serializing)]
     ext: String,
-    #[serde(skip_serializing)]
     vcodec: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    acodec: String,
+    filesize: Option<u64>,
+}
+
+#[derive(Debug, Serialize)]
+struct FormatResponse {
+    format_id: String,
+    height: u16,
     filesize: Option<u64>,
 }
 
 fn is_zero(value: &u16) -> bool {
     *value == 0
+}
+
+impl From<Format> for FormatResponse {
+    fn from(format: Format) -> Self {
+        Self {
+            format_id: format.format_id,
+            height: format.height,
+            filesize: format.filesize,
+        }
+    }
 }
 
 fn ensure_directory_exists(path: &str) -> Result<(), Error> {
@@ -95,6 +108,7 @@ impl Format {
             height: 0,
             ext: String::new(),
             vcodec: String::new(),
+            acodec: String::new(),
             filesize: None,
         }
     }
@@ -131,11 +145,14 @@ impl IntoIterator for SelectedFormatOptions {
             self.closest_to_4320p,
             self.larger_than_4320p,
         ]
-            .into_iter()
+        .into_iter()
     }
 }
 
-fn select_formats(mut formats: Vec<Format>, predicates: &[&dyn FormatPredicate]) -> SelectedFormatOptions {
+fn select_formats(
+    mut formats: Vec<Format>,
+    predicates: &[&dyn FormatPredicate],
+) -> SelectedFormatOptions {
     let mut selected_formats = SelectedFormatOptions::default();
 
     // Filter out unwanted formats
@@ -245,7 +262,7 @@ impl PlatformDownloader for YouTubeDownloader {
             .map_err(|error| Error::YtDlpExecutionFailed(error.to_string()))?;
 
         let formats_bytes = Command::new("jq")
-            .arg(r#"[.formats[] | select(.vcodec != "none" and .height != null) | {format_id, height, ext, vcodec, filesize}]"#)
+            .arg(r#"[.formats[] | select(.vcodec != "none" and .height != null) | {format_id, height, ext, vcodec, acodec, filesize}]"#)
             .stdin(video_details.stdout.unwrap())
             .output()
             .map_err(|error| Error::JqExecutionFailed(error.to_string()))?;
@@ -255,7 +272,10 @@ impl PlatformDownloader for YouTubeDownloader {
 
         // Filter out formats incompatible with iPhone
         let predicates: &[&dyn FormatPredicate] = &[&IsIphoneCompatible];
-        Ok(select_formats(formats, predicates).into_iter().flatten().collect())
+        Ok(select_formats(formats, predicates)
+            .into_iter()
+            .flatten()
+            .collect())
     }
 
     fn download(&self, url: &str, format_id: &str) -> Result<(), Error> {
@@ -593,11 +613,11 @@ async fn ui_handler() -> Html<&'static str> {
 
 async fn list_formats_handler(
     Query(request): Query<FormatsRequest>,
-) -> Result<Json<Vec<Format>>, (StatusCode, String)> {
+) -> Result<Json<Vec<FormatResponse>>, (StatusCode, String)> {
     println!("Received formats request for URL: {}", request.url);
     cached_list_formats(&request.url)
         .await
-        .map(Json)
+        .map(|formats| Json(formats.into_iter().map(FormatResponse::from).collect()))
         .map_err(api_error)
 }
 
@@ -904,6 +924,7 @@ mod cli_tests {
             height: 360,
             ext: "mp4".to_owned(),
             vcodec: "h264".to_owned(),
+            acodec: "aac".to_owned(),
             filesize: None,
         }
     }
@@ -968,7 +989,7 @@ mod downloader_unit_tests {
 
         assert_eq!(formats.len(), 1);
         assert_eq!(
-            serde_json::to_value(&formats[0]).unwrap(),
+            serde_json::to_value(FormatResponse::from(formats[0].clone())).unwrap(),
             serde_json::json!({ "format_id": "best" })
         );
     }
@@ -998,6 +1019,7 @@ mod downloader_unit_tests {
                 height: 144,
                 ext: "mp4".to_owned(),
                 vcodec: "avc1".to_owned(),
+                acodec: "aac".to_owned(),
                 filesize: None,
             },
             Format {
@@ -1005,6 +1027,7 @@ mod downloader_unit_tests {
                 height: 360,
                 ext: "mp4".to_owned(),
                 vcodec: "avc1".to_owned(),
+                acodec: "aac".to_owned(),
                 filesize: None,
             },
             Format {
@@ -1012,12 +1035,16 @@ mod downloader_unit_tests {
                 height: 1080,
                 ext: "mp4".to_owned(),
                 vcodec: "avc1".to_owned(),
+                acodec: "aac".to_owned(),
                 filesize: None,
             },
         ];
 
         let predicates = &[];
-        let selected: Vec<Format> = select_formats(formats, predicates).into_iter().flatten().collect();
+        let selected: Vec<Format> = select_formats(formats, predicates)
+            .into_iter()
+            .flatten()
+            .collect();
 
         assert_eq!(
             selected
