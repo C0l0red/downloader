@@ -103,6 +103,16 @@ struct MediaMetadata {
     entries: Option<Vec<MediaEntryMetadata>>,
 }
 
+impl MediaMetadata {
+    fn is_playlist(&self) -> bool {
+        self.entries.is_some()
+    }
+
+    fn entry_count(&self) -> usize {
+        self.entries.as_ref().map_or(0, |entries| entries.len())
+    }
+}
+
 #[derive(Debug, Deserialize, Serialize)]
 struct MediaEntryMetadata {
     title: String,
@@ -217,7 +227,7 @@ impl Format {
 }
 
 #[derive(Default, Debug)]
-struct SelectedFormatOptions {
+struct DeduplicatedFormatOptions {
     closest_to_144p: Option<Format>,
     closest_to_240p: Option<Format>,
     closest_to_360p: Option<Format>,
@@ -230,7 +240,7 @@ struct SelectedFormatOptions {
     larger_than_4320p: Option<Format>,
 }
 
-impl IntoIterator for SelectedFormatOptions {
+impl IntoIterator for DeduplicatedFormatOptions {
     type Item = Option<Format>;
     type IntoIter = IntoIter<Option<Format>, MAX_FORMAT_OPTIONS>;
 
@@ -251,16 +261,46 @@ impl IntoIterator for SelectedFormatOptions {
     }
 }
 
-fn select_formats(
-    mut formats: Vec<Format>,
+fn filter_media_metadata_formats(
+    media_metadata: &mut MediaMetadata,
     predicates: &[&dyn FormatPredicate],
-) -> SelectedFormatOptions {
-    let mut selected_formats = SelectedFormatOptions::default();
+) -> Result<(), Error> {
+    // If the media metadata is a playlist, filter the formats of each entry
+    if media_metadata.is_playlist() {
+        let Some(entries) = media_metadata.entries.as_mut() else {
+            return Err(Error::Internal("Playlist entries not found".to_string()));
+        };
 
-    // Filter out unwanted formats
-    for predicate in predicates {
-        formats.retain(|format| predicate.matches(format));
+        // Retain formats that match all predicates and then group remaining formats using select_formats
+        for entry in entries {
+            entry
+                .formats
+                .retain(|format| predicates.iter().all(|predicate| predicate.matches(format)));
+            let formats = std::mem::take(&mut entry.formats);
+            entry.formats = deduplicate_by_resolution(formats)
+                .into_iter()
+                .flatten()
+                .collect();
+        }
+        Ok(())
+    } else {
+        // Retain formats that match all predicates and then group remaining formats using select_formats
+        media_metadata
+            .formats
+            .retain(|format| predicates.iter().all(|predicate| predicate.matches(format)));
+        let formats = std::mem::take(&mut media_metadata.formats);
+        media_metadata.formats = deduplicate_by_resolution(formats)
+            .into_iter()
+            .flatten()
+            .collect();
+        Ok(())
     }
+}
+
+fn deduplicate_by_resolution(
+    mut formats: Vec<Format>,
+) -> DeduplicatedFormatOptions {
+    let mut deduplicated_formats = DeduplicatedFormatOptions::default();
 
     // Sort formats by height and then by filesize presence
     formats.sort_by(|a, b| {
@@ -271,27 +311,28 @@ fn select_formats(
 
     for format in formats {
         match format.height {
-            Some(res) if res <= 144 => selected_formats.closest_to_144p = Some(format),
-            Some(res) if res <= 144 + 240 / 2 => selected_formats.closest_to_240p = Some(format),
-            Some(res) if res <= 240 + 360 / 2 => selected_formats.closest_to_360p = Some(format),
-            Some(res) if res <= 360 + 480 / 2 => selected_formats.closest_to_480p = Some(format),
-            Some(res) if res <= 480 + 720 / 2 => selected_formats.closest_to_720p = Some(format),
-            Some(res) if res <= 720 + 1080 / 2 => selected_formats.closest_to_1080p = Some(format),
-            Some(res) if res <= 1080 + 1440 / 2 => selected_formats.closest_to_1440p = Some(format),
-            Some(res) if res <= 1440 + 2160 / 2 => selected_formats.closest_to_2160p = Some(format),
-            Some(res) if res <= 2160 + 4320 / 2 => selected_formats.closest_to_4320p = Some(format),
-            Some(_) => selected_formats.larger_than_4320p = Some(format),
+            Some(res) if res <= 144 => deduplicated_formats.closest_to_144p = Some(format),
+            Some(res) if res <= 144 + 240 / 2 => deduplicated_formats.closest_to_240p = Some(format),
+            Some(res) if res <= 240 + 360 / 2 => deduplicated_formats.closest_to_360p = Some(format),
+            Some(res) if res <= 360 + 480 / 2 => deduplicated_formats.closest_to_480p = Some(format),
+            Some(res) if res <= 480 + 720 / 2 => deduplicated_formats.closest_to_720p = Some(format),
+            Some(res) if res <= 720 + 1080 / 2 => deduplicated_formats.closest_to_1080p = Some(format),
+            Some(res) if res <= 1080 + 1440 / 2 => deduplicated_formats.closest_to_1440p = Some(format),
+            Some(res) if res <= 1440 + 2160 / 2 => deduplicated_formats.closest_to_2160p = Some(format),
+            Some(res) if res <= 2160 + 4320 / 2 => deduplicated_formats.closest_to_4320p = Some(format),
+            Some(_) => deduplicated_formats.larger_than_4320p = Some(format),
             None => {}
         }
     }
 
-    selected_formats
+    deduplicated_formats
 }
 
 trait FormatPredicate {
     fn matches(&self, format: &Format) -> bool;
 }
 
+/// Predicate for finding formats compatible with iPhone by checking for MP4 extension and AVC1 video codec
 struct IsIphoneCompatible;
 
 impl FormatPredicate for IsIphoneCompatible {
@@ -301,6 +342,19 @@ impl FormatPredicate for IsIphoneCompatible {
                 .vcodec
                 .as_ref()
                 .is_some_and(|vcodec| vcodec.starts_with("avc1"))
+    }
+}
+
+/// Predicate for finding video formats by ensuring height and vcodec metadata exist
+struct IsVideoFormat;
+
+impl FormatPredicate for IsVideoFormat {
+    fn matches(&self, format: &Format) -> bool {
+        format.height.is_some()
+            && format
+                .vcodec
+                .as_ref()
+                .is_some_and(|vcodec| vcodec != "none")
     }
 }
 
@@ -474,28 +528,15 @@ impl PlatformDownloader for YouTubeDownloader {
             .cookies_path(self.config.youtube_cookies_path.clone())
             .build()?
             .get_metadata()?;
-        let formats = metadata
-            .get("formats")
-            .and_then(serde_json::Value::as_array)
-            .ok_or_else(|| {
-                Error::FormatDeserializationFailed("Missing formats metadata".to_owned())
-            })?
-            .iter()
-            .filter(|format| {
-                format.get("vcodec").and_then(serde_json::Value::as_str) != Some("none")
-                    && format.get("height").is_some_and(|height| !height.is_null())
-            })
-            .cloned()
-            .map(serde_json::from_value)
-            .collect::<Result<Vec<Format>, _>>()
-            .map_err(|error| Error::FormatDeserializationFailed(error.to_string()))?;
+        let mut media_metadata: MediaMetadata = serde_json::from_value(metadata).map_err(|error| {
+            Error::FormatDeserializationFailed(format!("Failed to deserialize metadata: {}", error))
+        })?;
 
-        // Filter out formats incompatible with iPhone
-        let predicates: &[&dyn FormatPredicate] = &[&IsIphoneCompatible];
-        Ok(select_formats(formats, predicates)
-            .into_iter()
-            .flatten()
-            .collect())
+        // Filter out non-video formats and formats incompatible with iPhone
+        let predicates: &[&dyn FormatPredicate] = &[&IsVideoFormat, &IsIphoneCompatible];
+        filter_media_metadata_formats(&mut media_metadata, predicates)?;
+
+        Ok(media_metadata.formats)
     }
 
     fn download(
@@ -1124,8 +1165,7 @@ mod downloader_unit_tests {
             },
         ];
 
-        let predicates = &[];
-        let selected: Vec<Format> = select_formats(formats, predicates)
+        let selected: Vec<Format> = deduplicate_by_resolution(formats)
             .into_iter()
             .flatten()
             .collect();
