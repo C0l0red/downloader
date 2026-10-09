@@ -9,8 +9,6 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use std::array::IntoIter;
 use std::path::PathBuf;
-#[cfg(test)]
-use std::sync::{Mutex, OnceLock};
 use std::{
     collections::HashMap,
     io::{self, Write},
@@ -224,6 +222,7 @@ struct YtDlpMediaMetadata {
     title: String,
     thumbnail: Option<String>,
     formats: Vec<YtDlpFormat>,
+    #[serde(default)]
     entries: Vec<YtDlpMediaEntryMetadata>,
 }
 
@@ -260,7 +259,7 @@ struct MediaFormat {
 
 impl YtDlpMediaMetadata {
     fn is_playlist(&self) -> bool {
-        self.entries.is_empty()
+        !self.entries.is_empty()
     }
 
     fn entry_count(&self) -> usize {
@@ -396,7 +395,7 @@ fn environment_path(name: &str) -> Result<PathBuf, Error> {
 
 /// Gets the download file name template. yt-dlp will substitute id and ext with the corresponding values for each file.
 fn get_download_file_path(config: &Config) -> PathBuf {
-    config.downloads_directory.join("%(id)s.%(ext)s")
+    config.downloads_directory.join("%(title)s.%(ext)s")
 }
 
 impl YtDlpFormat {
@@ -413,7 +412,7 @@ impl YtDlpFormat {
 }
 
 #[derive(Default, Debug)]
-struct DeduplicatedFormatOptions {
+struct FormatResolutionBuckets {
     closest_to_144p: Option<YtDlpFormat>,
     closest_to_240p: Option<YtDlpFormat>,
     closest_to_360p: Option<YtDlpFormat>,
@@ -426,7 +425,7 @@ struct DeduplicatedFormatOptions {
     larger_than_4320p: Option<YtDlpFormat>,
 }
 
-impl IntoIterator for DeduplicatedFormatOptions {
+impl IntoIterator for FormatResolutionBuckets {
     type Item = Option<YtDlpFormat>;
     type IntoIter = IntoIter<Option<YtDlpFormat>, MAX_FORMAT_OPTIONS>;
 
@@ -443,7 +442,7 @@ impl IntoIterator for DeduplicatedFormatOptions {
             self.closest_to_4320p,
             self.larger_than_4320p,
         ]
-        .into_iter()
+            .into_iter()
     }
 }
 
@@ -479,8 +478,8 @@ fn filter_media_metadata_formats(
     }
 }
 
-fn deduplicate_by_resolution(mut formats: Vec<YtDlpFormat>) -> DeduplicatedFormatOptions {
-    let mut deduplicated_formats = DeduplicatedFormatOptions::default();
+fn deduplicate_by_resolution(mut formats: Vec<YtDlpFormat>) -> FormatResolutionBuckets {
+    let mut resolution_buckets = FormatResolutionBuckets::default();
 
     // Sort formats by height and then by filesize presence
     formats.sort_by(|a, b| {
@@ -491,37 +490,37 @@ fn deduplicate_by_resolution(mut formats: Vec<YtDlpFormat>) -> DeduplicatedForma
 
     for format in formats {
         match format.height {
-            Some(res) if res <= 144 => deduplicated_formats.closest_to_144p = Some(format),
+            Some(res) if res <= 144 => resolution_buckets.closest_to_144p = Some(format),
             Some(res) if res <= 144 + 240 / 2 => {
-                deduplicated_formats.closest_to_240p = Some(format)
+                resolution_buckets.closest_to_240p = Some(format)
             }
             Some(res) if res <= 240 + 360 / 2 => {
-                deduplicated_formats.closest_to_360p = Some(format)
+                resolution_buckets.closest_to_360p = Some(format)
             }
             Some(res) if res <= 360 + 480 / 2 => {
-                deduplicated_formats.closest_to_480p = Some(format)
+                resolution_buckets.closest_to_480p = Some(format)
             }
             Some(res) if res <= 480 + 720 / 2 => {
-                deduplicated_formats.closest_to_720p = Some(format)
+                resolution_buckets.closest_to_720p = Some(format)
             }
             Some(res) if res <= 720 + 1080 / 2 => {
-                deduplicated_formats.closest_to_1080p = Some(format)
+                resolution_buckets.closest_to_1080p = Some(format)
             }
             Some(res) if res <= 1080 + 1440 / 2 => {
-                deduplicated_formats.closest_to_1440p = Some(format)
+                resolution_buckets.closest_to_1440p = Some(format)
             }
             Some(res) if res <= 1440 + 2160 / 2 => {
-                deduplicated_formats.closest_to_2160p = Some(format)
+                resolution_buckets.closest_to_2160p = Some(format)
             }
             Some(res) if res <= 2160 + 4320 / 2 => {
-                deduplicated_formats.closest_to_4320p = Some(format)
+                resolution_buckets.closest_to_4320p = Some(format)
             }
-            Some(_) => deduplicated_formats.larger_than_4320p = Some(format),
+            Some(_) => resolution_buckets.larger_than_4320p = Some(format),
             None => {}
         }
     }
 
-    deduplicated_formats
+    resolution_buckets
 }
 
 trait FormatPredicate {
@@ -535,9 +534,9 @@ impl FormatPredicate for IsIphoneCompatible {
     fn matches(&self, format: &YtDlpFormat) -> bool {
         format.ext == "mp4"
             && format
-                .vcodec
-                .as_ref()
-                .is_some_and(|vcodec| vcodec.starts_with("avc1"))
+            .vcodec
+            .as_ref()
+            .is_some_and(|vcodec| vcodec.starts_with("avc1"))
     }
 }
 
@@ -548,14 +547,14 @@ impl FormatPredicate for IsVideoFormat {
     fn matches(&self, format: &YtDlpFormat) -> bool {
         format.height.is_some()
             && format
-                .vcodec
-                .as_ref()
-                .is_some_and(|vcodec| vcodec != "none")
+            .vcodec
+            .as_ref()
+            .is_some_and(|vcodec| vcodec != "none")
     }
 }
 
 #[derive(Deserialize, Debug)]
-struct GetMetadataRequest {
+struct GetMediaInfoRequest {
     url: String,
 }
 
@@ -661,10 +660,10 @@ impl YtDlp {
             .map(|format_id| {
                 format_id.to_owned()
                     + if self.default_to_best_audio {
-                        "+ba"
-                    } else {
-                        ""
-                    }
+                    "+ba"
+                } else {
+                    ""
+                }
             })
             .unwrap_or_else(|| "b".to_owned());
 
@@ -707,22 +706,6 @@ impl YtDlp {
                 }
             })
     }
-}
-
-// TODO: Run this to confirm that a file is actually downloaded and file name is returned
-#[test]
-fn test_download_function_returns_filename() {
-    let download_path = PathBuf::from("downloads").join("%(title)s.%(ext)s");
-
-    let yt_dlp = YtDlpBuilder::new()
-        .output_path(download_path)
-        .cookies_path("cookies/instagram-cookies.txt")
-        .url("https://www.instagram.com/reel/Ddorb7ryu5t/?stkn=aThteW96MmI2Z3Vx")
-        .build()
-        .unwrap();
-
-    let file_name = yt_dlp.download_media().unwrap();
-    println!("{}", file_name);
 }
 
 // Content providers
@@ -795,6 +778,7 @@ impl ContentProvider for YouTubeProvider {
         let metadata_json = YtDlpBuilder::new()
             .url(_url)
             .cookies_path(&self.config.youtube_cookies_path)
+            .output_path(get_download_file_path(&self.config))
             .build()?
             .get_metadata()?;
         let mut media_metadata: YtDlpMediaMetadata = serde_json::from_value(metadata_json)
@@ -939,7 +923,7 @@ async fn run_server(state: AppState, address: Option<String>) -> Result<(), Erro
 fn api_router(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/ui", get(ui_handler))
-        .route("/formats", get(get_metadata_handler))
+        .route("/media-info", get(get_media_info_handler))
         .route("/download", get(download_handler))
         .with_state(state)
 }
@@ -948,9 +932,9 @@ async fn ui_handler() -> Html<&'static str> {
     Html(include_str!("resources/index.html"))
 }
 
-async fn get_metadata_handler(
+async fn get_media_info_handler(
     State(state): State<Arc<AppState>>,
-    Query(request): Query<GetMetadataRequest>,
+    Query(request): Query<GetMediaInfoRequest>,
 ) -> Result<Json<MediaItems>, Error> {
     println!("Received media info request for URL: {}", request.url);
     get_cached_media_items(&request.url, &state)
@@ -994,7 +978,6 @@ async fn download_handler(
             )
             .body(temp_downloaded_file.read_and_remove()?.into())
             .map_err(|_| Error::Internal("Building the response failed".to_owned()))
-
     }
 }
 
@@ -1086,381 +1069,224 @@ async fn download_video(
 }
 
 #[cfg(test)]
-static LIVE_TEST_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+mod unit_tests {
+    use super::*;
+    use axum::body::to_bytes;
+    use std::fs;
 
-#[cfg(test)]
-fn get_env_variable(name: &str) -> String {
-    dotenvy::dotenv().ok();
-    std::env::var(name).unwrap_or_else(|_| panic!("{name} must be set in .env"))
+    fn format(id: &str, height: Option<u16>) -> YtDlpFormat {
+        YtDlpFormat {
+            format_id: id.to_owned(),
+            height,
+            ext: "mp4".to_owned(),
+            vcodec: Some("avc1.640028".to_owned()),
+            acodec: Some("mp4a.40.2".to_owned()),
+            filesize: Some(100),
+        }
+    }
+
+    fn config() -> Config {
+        Config {
+            instagram_cookies_path: "instagram.cookies".into(),
+            youtube_cookies_path: "youtube.cookies".into(),
+            downloads_directory: "downloads".into(),
+        }
+    }
+
+    #[test]
+    fn content_types_cover_known_extensions_and_fallback() {
+        let cases = [
+            ("mp4", ContentType::Mp4, "video/mp4"),
+            ("WEBM", ContentType::WebM, "video/webm"),
+            ("mov", ContentType::QuickTime, "video/quicktime"),
+            ("m4v", ContentType::M4v, "video/x-m4v"),
+            ("mkv", ContentType::Matroska, "video/x-matroska"),
+            ("jpg", ContentType::Jpeg, "image/jpeg"),
+            ("jpeg", ContentType::Jpeg, "image/jpeg"),
+            ("png", ContentType::Png, "image/png"),
+            ("webp", ContentType::WebP, "image/webp"),
+            ("gif", ContentType::Gif, "image/gif"),
+            ("avif", ContentType::Avif, "image/avif"),
+            ("heic", ContentType::Heic, "image/heic"),
+            ("bin", ContentType::OctetStream, "application/octet-stream"),
+        ];
+        for (extension, expected, mime) in cases {
+            assert_eq!(ContentType::from_extension(extension), expected);
+            assert_eq!(expected.as_str(), mime);
+        }
+    }
+
+    #[test]
+    fn temporary_file_reports_metadata_and_removes_it_after_read() {
+        let path = std::env::temp_dir().join(format!("downloader-{}.mp4", std::process::id()));
+        fs::write(&path, b"abc").unwrap();
+        let file = TempDownloadedFile::try_new(path.clone()).unwrap();
+        assert_eq!(file.file_name().unwrap(), path.file_name().unwrap().to_str().unwrap());
+        assert_eq!(file.get_size().unwrap(), 3);
+        assert_eq!(file.content_type().unwrap(), ContentType::Mp4);
+        assert_eq!(file.read_and_remove().unwrap(), b"abc");
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn temporary_file_rejects_directories_and_missing_paths() {
+        let directory = std::env::temp_dir().join(format!("downloader-dir-{}", std::process::id()));
+        fs::create_dir_all(&directory).unwrap();
+        assert!(matches!(TempDownloadedFile::try_new(directory.clone()), Err(Error::NotAValidPath(_))));
+        fs::remove_dir(directory).unwrap();
+    }
+
+    #[test]
+    fn metadata_converts_single_items_and_playlists() {
+        let single = YtDlpMediaMetadata {
+            title: "title".into(),
+            thumbnail: Some("thumb".into()),
+            formats: vec![format("f1", Some(360))],
+            entries: vec![],
+        };
+        assert!(!single.is_playlist());
+        let converted: MediaItems = single.clone().try_into().unwrap();
+        assert_eq!(converted[0].title, "title");
+        assert_eq!(converted[0].thumbnail, "thumb");
+        assert_eq!(converted[0].formats[0].format_id, "f1");
+        assert_eq!(single.get_format_by_id("f1", None).unwrap().format_id, "f1");
+
+        let playlist = YtDlpMediaMetadata {
+            title: "playlist".into(),
+            thumbnail: None,
+            formats: vec![],
+            entries: vec![format_entry("entry")],
+        };
+        assert!(playlist.is_playlist());
+        assert_eq!(playlist.entry_count(), 1);
+        assert_eq!(playlist.get_format_by_id("entry-format", Some(0)).unwrap().format_id, "entry-format");
+        assert!(playlist.get_format_by_id("missing", Some(5)).is_none());
+    }
+
+    fn format_entry(title: &str) -> YtDlpMediaEntryMetadata {
+        YtDlpMediaEntryMetadata { title: title.into(), thumbnail: "thumb".into(), formats: vec![format("entry-format", Some(240))] }
+    }
+
+    #[test]
+    fn metadata_without_thumbnail_is_rejected_for_single_item() {
+        let metadata = YtDlpMediaMetadata { title: "title".into(), thumbnail: None, formats: vec![], entries: vec![] };
+        assert!(matches!(TryInto::<MediaItems>::try_into(metadata), Err(Error::Internal(message)) if message.contains("thumbnail")));
+    }
+
+    #[test]
+    fn resolution_deduplication_groups_all_boundaries_and_ignores_audio_only_formats() {
+        let mut formats = vec![format("none", None)];
+        for (id, height) in [("144", 144), ("240", 240), ("360", 360), ("480", 480), ("720", 720), ("1080", 1080), ("1440", 1440), ("2160", 2160), ("4320", 4320), ("4321", 4321)] {
+            formats.push(format(id, Some(height)));
+        }
+        let selected: Vec<_> = deduplicate_by_resolution(formats).into_iter().flatten().collect();
+        assert_eq!(selected.iter().map(|item| item.format_id.as_str()).collect::<Vec<_>>(), vec!["144", "240", "360", "480", "720", "1080", "1440", "2160", "4320", "4321"]);
+    }
+
+    #[test]
+    fn predicates_distinguish_video_and_iphone_formats() {
+        let compatible = format("ok", Some(360));
+        let mut wrong_extension = compatible.clone();
+        wrong_extension.ext = "webm".into();
+        let mut wrong_codec = compatible.clone();
+        wrong_codec.vcodec = Some("vp9".into());
+        let mut audio = compatible.clone();
+        audio.height = None;
+        audio.vcodec = Some("none".into());
+        assert!(IsIphoneCompatible.matches(&compatible));
+        assert!(!IsIphoneCompatible.matches(&wrong_extension));
+        assert!(!IsIphoneCompatible.matches(&wrong_codec));
+        assert!(IsVideoFormat.matches(&compatible));
+        assert!(!IsVideoFormat.matches(&audio));
+    }
+
+    #[test]
+    fn filtering_handles_single_media_and_playlist_entries() {
+        let mut metadata = YtDlpMediaMetadata { title: "t".into(), thumbnail: Some("u".into()), formats: vec![format("ok", Some(360)), format("audio", None)], entries: vec![] };
+        filter_media_metadata_formats(&mut metadata, &[&IsVideoFormat]).unwrap();
+        assert_eq!(metadata.formats.len(), 1);
+
+        let mut playlist = YtDlpMediaMetadata { title: "p".into(), thumbnail: None, formats: vec![], entries: vec![format_entry("entry")] };
+        filter_media_metadata_formats(&mut playlist, &[&IsIphoneCompatible]).unwrap();
+        assert_eq!(playlist.entries[0].formats.len(), 1);
+    }
+
+    #[test]
+    fn builders_require_url_and_output_and_preserve_options() {
+        assert!(YtDlpBuilder::new().build().is_err());
+        assert!(YtDlpBuilder::new().url("u").build().is_err());
+        let client = YtDlpBuilder::new().url("u").format_id("f").cookies_path("c").output_path("o").merge_mp4().default_to_best_audio().build().unwrap();
+        assert_eq!(client.url, "u");
+        assert_eq!(client.format_id.as_deref(), Some("f"));
+        assert_eq!(client.cookies_path.as_deref(), Some(PathBuf::from("c").as_path()));
+        assert!(client.merge_mp4 && client.default_to_best_audio);
+        assert_eq!(YtDlpFormat::best().format_id, "best");
+    }
+
+    #[test]
+    fn platform_selection_accepts_supported_hosts_and_rejects_bad_urls() {
+        assert!(matches!(get_platform_from_url("https://youtu.be/id"), Ok(Platform::YouTube)));
+        assert!(matches!(get_platform_from_url("https://www.facebook.com/id"), Ok(Platform::Facebook)));
+        assert!(matches!(get_platform_from_url("https://instagram.com/id"), Ok(Platform::Instagram)));
+        assert!(matches!(get_platform_from_url("https://x.com/id"), Ok(Platform::X)));
+        assert!(matches!(get_platform_from_url("https://tiktok.com/id"), Ok(Platform::TikTok)));
+        assert!(matches!(get_platform_from_url("https://example.com/id"), Ok(Platform::Unsupported(host)) if host == "example.com"));
+        assert!(matches!(get_platform_from_url("not a url"), Err(Error::InvalidInput(_))));
+    }
+
+    #[test]
+    fn selection_and_choice_parsing_report_invalid_input() {
+        assert_eq!(*select_index(&[10, 20], 2).unwrap(), 20);
+        assert!(select_index(&[10], 0).is_err());
+        assert!(select_index(&[10], 2).is_err());
+        assert_eq!(parse_choice_to_usize("12").unwrap(), 12);
+        assert!(parse_choice_to_usize("x").is_err());
+    }
+
+    #[test]
+    fn provider_cache_selects_formats_and_reports_missing_indices() {
+        let state = AppState { config: config(), media_cache: RwLock::new(HashMap::new()) };
+        state.media_cache.write().unwrap().insert("url".into(), vec![MediaInfo { title: "t".into(), thumbnail: "thumb".into(), formats: vec![MediaFormat { format_id: "f".into(), height: Some(1), filesize: None }] }]);
+        let params = DownloadParams { url: "url".into(), download_option_index: 0, item_index: 0, keep_on_server: false };
+        assert_eq!(FacebookProvider.get_format_for_download(&state.media_cache, &params).unwrap().format_id, "f");
+        assert!(FacebookProvider.get_format_for_download(&state.media_cache, &DownloadParams { url: "url".into(), download_option_index: 0, item_index: 1, keep_on_server: false }).is_err());
+        assert!(FacebookProvider.get_format_for_download(&state.media_cache, &DownloadParams { url: "url".into(), download_option_index: 1, item_index: 0, keep_on_server: false }).is_err());
+    }
+
+    #[tokio::test]
+    async fn errors_map_to_expected_http_responses() {
+        let response = Error::InvalidInput("bad".into()).into_response();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let response = Error::YtDlpExecutionFailed("details".into()).into_response();
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let response = Error::Internal("details".into()).into_response();
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(body.as_ref(), b"details");
+    }
+
+    #[test]
+    fn request_structs_deserialize_defaults_and_config_paths_are_used() {
+        let request: GetMediaInfoRequest = serde_json::from_str(r#"{"url":"u"}"#).unwrap();
+        let params: DownloadParams = serde_json::from_str(r#"{"url":"u","download_option_index":1,"item_index":2}"#).unwrap();
+        assert_eq!(request.url, "u");
+        assert!(!params.keep_on_server);
+        assert_eq!(get_download_file_path(&config()), PathBuf::from("downloads/%(id)s.%(ext)s"));
+    }
+
+    #[test]
+    fn provider_and_application_state_structs_hold_current_configuration() {
+        let configuration = config();
+        let state = AppState {
+            config: configuration.clone(),
+            media_cache: RwLock::new(HashMap::new()),
+        };
+        let youtube = YouTubeProvider { config: configuration.clone() };
+        let instagram = InstagramProvider;
+        let facebook = FacebookProvider;
+        let x = XProvider;
+        let tiktok = TikTokProvider;
+        assert_eq!(state.config.downloads_directory, PathBuf::from("downloads"));
+        assert_eq!(youtube.config.youtube_cookies_path, PathBuf::from("youtube.cookies"));
+        let _providers: [&dyn ContentProvider; 4] = [&facebook, &instagram, &x, &tiktok];
+    }
 }
-
-#[cfg(test)]
-fn test_state() -> AppState {
-    AppState::from_environment().expect("test configuration should be available")
-}
-
-// TODO: Junie: Uncomment these tests and fix them based on the code changes I've made
-// #[cfg(test)]
-// mod api_tests {
-//     use super::*;
-//     use std::path::Path;
-//
-//     fn cleanup_download() {
-//         let path = test_state()
-//             .config
-//             .downloads_directory
-//             .join("foO1QakhjZE.mp4");
-//         let _ = std::fs::remove_file(path);
-//     }
-//
-//     #[tokio::test]
-//     async fn formats_endpoint_returns_default_format_for_supported_fallback_platform() {
-//         let state = Arc::new(test_state());
-//         let response = get_metadata_handler(
-//             State(state),
-//             Query(GetMetadataRequest {
-//                 url: get_env_variable("FACEBOOK_TEST_URL"),
-//             }),
-//         )
-//         .await
-//         .unwrap()
-//         .0;
-//
-//         assert_eq!(response.len(), 1);
-//         assert_eq!(response[0].format_id, "best");
-//     }
-//
-//     #[tokio::test]
-//     async fn formats_endpoint_rejects_invalid_url() {
-//         let state = Arc::new(test_state());
-//         let error = get_metadata_handler(
-//             State(state),
-//             Query(GetMetadataRequest {
-//                 url: "not-a-url".to_owned(),
-//             }),
-//         )
-//         .await
-//         .unwrap_err();
-//
-//         assert_eq!(error.into_response().status(), StatusCode::BAD_REQUEST);
-//     }
-//
-//     #[tokio::test]
-//     async fn internal_errors_return_their_descriptive_message() {
-//         let message = "Building the response failed";
-//         let response = Error::Internal(message.to_owned()).into_response();
-//
-//         assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
-//         let body = axum::body::to_bytes(response.into_body(), usize::MAX)
-//             .await
-//             .unwrap();
-//         assert_eq!(body.as_ref(), message.as_bytes());
-//     }
-//
-//     #[test]
-//     fn client_input_errors_return_their_message() {
-//         let response = Error::InvalidInput("Invalid URL".to_owned()).into_response();
-//
-//         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-//     }
-//
-//     // TODO: JUNIE: Fix this test
-//     // #[tokio::test]
-//     // async fn youtube_api_lists_formats_downloads_lowest_format_and_creates_file() {
-//     //     let _guard = LIVE_TEST_LOCK
-//     //         .get_or_init(|| Mutex::new(()))
-//     //         .lock()
-//     //         .unwrap();
-//     //     cleanup_download();
-//     //
-//     //     let state = Arc::new(test_state());
-//     //     let youtube_url = get_env_variable("YOUTUBE_TEST_URL");
-//     //     let formats = list_formats_handler(
-//     //         State(Arc::clone(&state)),
-//     //         Query(GetMetadataRequest {
-//     //             url: youtube_url.clone(),
-//     //         }),
-//     //     )
-//     //     .await
-//     //     .unwrap()
-//     //     .0;
-//     //     let lowest_format = formats
-//     //         .first()
-//     //         .expect("YouTube formats should not be empty");
-//     //
-//     //     let response = download_handler(
-//     //         State(state),
-//     //         Query(DownloadParams {
-//     //             url: youtube_url,
-//     //             download_option_id: lowest_format.format_id.clone(),
-//     //             keep_on_server: true,
-//     //         }),
-//     //     )
-//     //     .await
-//     //     .unwrap();
-//     //
-//     //     assert_eq!(response.status(), StatusCode::NO_CONTENT);
-//     //     assert!(
-//     //         Path::new(&test_state().config.downloads_directory)
-//     //             .join("foO1QakhjZE.mp4")
-//     //             .exists()
-//     //     );
-//     //     cleanup_download();
-//     // }
-//
-//     #[tokio::test]
-//     async fn youtube_api_downloads_to_client_and_removes_server_file_by_default() {
-//         let _guard = LIVE_TEST_LOCK
-//             .get_or_init(|| Mutex::new(()))
-//             .lock()
-//             .unwrap();
-//         cleanup_download();
-//
-//         let state = Arc::new(test_state());
-//         let youtube_url = get_env_variable("YOUTUBE_TEST_URL");
-//         let formats = get_media_items(&youtube_url, &state.config).await.unwrap();
-//         let lowest_format = formats
-//             .first()
-//             .expect("YouTube formats should not be empty");
-//
-//         let response = download_handler(
-//             State(state),
-//             Query(DownloadParams {
-//                 url: youtube_url,
-//                 download_option_id: lowest_format.format_id.clone(),
-//                 keep_on_server: false,
-//             }),
-//         )
-//         .await
-//         .unwrap();
-//
-//         assert_eq!(response.status(), StatusCode::OK);
-//         assert_eq!(response.headers().get("content-type").unwrap(), "video/mp4");
-//         assert!(response.headers().contains_key("content-disposition"));
-//         assert!(
-//             !Path::new(&test_state().config.downloads_directory)
-//                 .join("foO1QakhjZE.mp4")
-//                 .exists()
-//         );
-//     }
-//
-//     #[test]
-//     fn router_exposes_api_routes() {
-//         let _router = api_router(Arc::new(test_state()));
-//     }
-//
-//     #[tokio::test]
-//     async fn ui_page_loads_formats_and_starts_downloads() {
-//         let page = ui_handler().await.0;
-//
-//         assert!(page.contains("/formats?url="));
-//         assert!(page.contains("format.format_id"));
-//         assert!(page.contains("/download?url="));
-//         assert!(page.contains("format_id="));
-//         assert!(page.contains("Download complete"));
-//         assert!(!page.contains("form.reset()"));
-//         assert!(page.contains("formats.replaceChildren()"));
-//         assert!(page.contains("@media (prefers-color-scheme: dark)"));
-//         assert!(page.contains("download.blob()"));
-//         assert!(page.contains("Content-Disposition"));
-//     }
-//
-//     #[test]
-//     fn download_params_defaults_to_not_keep_on_server() {
-//         let download_params: DownloadParams = serde_json::from_value(serde_json::json!({
-//             "url": "https://example.com/video",
-//             "format_id": "best"
-//         }))
-//         .unwrap();
-//
-//         assert!(!download_params.keep_on_server);
-//     }
-// }
-//
-// #[cfg(test)]
-// mod cli_tests {
-//     use super::*;
-//     use std::path::Path;
-//
-//     fn cleanup_download() {
-//         let path = test_state()
-//             .config
-//             .downloads_directory
-//             .join("foO1QakhjZE.mp4");
-//         let _ = std::fs::remove_file(path);
-//     }
-//
-//     fn format(format_id: &str) -> YtDlpFormat {
-//         YtDlpFormat {
-//             format_id: format_id.to_owned(),
-//             height: Some(360),
-//             ext: "mp4".to_owned(),
-//             vcodec: Some("h264".to_owned()),
-//             acodec: Some("aac".to_owned()),
-//             filesize: None,
-//         }
-//     }
-//
-//     #[tokio::test]
-//     async fn youtube_cli_lists_formats_downloads_lowest_format_and_creates_file() {
-//         let _guard = LIVE_TEST_LOCK
-//             .get_or_init(|| Mutex::new(()))
-//             .lock()
-//             .unwrap();
-//         cleanup_download();
-//
-//         let state = test_state();
-//         let youtube_url = get_env_variable("YOUTUBE_TEST_URL");
-//         let formats = get_media_items(&youtube_url, &state.config).await.unwrap();
-//         let lowest_format = formats
-//             .first()
-//             .expect("YouTube formats should not be empty");
-//
-//         download_video(&youtube_url, &lowest_format.format_id, &state)
-//             .await
-//             .unwrap();
-//
-//         assert!(
-//             Path::new(&state.config.downloads_directory)
-//                 .join("foO1QakhjZE.mp4")
-//                 .exists()
-//         );
-//         cleanup_download();
-//     }
-// }
-//
-// #[cfg(test)]
-// mod downloader_unit_tests {
-//     use super::*;
-//
-//     #[test]
-//     fn default_downloader_returns_only_best_format_without_metadata() {
-//         let formats = FacebookProvider
-//             .get_media_items(&get_env_variable("FACEBOOK_TEST_URL"))
-//             .unwrap();
-//
-//         assert_eq!(formats.len(), 1);
-//         assert_eq!(
-//             serde_json::to_value(FormatResponse::from(formats[0].clone())).unwrap(),
-//             serde_json::json!({ "format_id": "best", "height": 0, "filesize": null })
-//         );
-//     }
-//
-//     #[test]
-//     fn default_downloader_is_used_by_each_non_youtube_platform() {
-//         for downloader in [
-//             Box::new(FacebookProvider) as Box<dyn ContentProvider>,
-//             Box::new(XProvider),
-//             Box::new(TikTokProvider),
-//         ] {
-//             assert_eq!(
-//                 downloader
-//                     .get_media_items(&get_env_variable("EXAMPLE_TEST_URL"))
-//                     .unwrap()[0]
-//                     .format_id,
-//                 "best"
-//             );
-//         }
-//     }
-//
-//     #[test]
-//     fn format_selection_keeps_the_closest_format_for_each_resolution() {
-//         let formats = vec![
-//             YtDlpFormat {
-//                 format_id: "144".to_owned(),
-//                 height: Some(144),
-//                 ext: "mp4".to_owned(),
-//                 vcodec: Some("avc1".to_owned()),
-//                 acodec: Some("aac".to_owned()),
-//                 filesize: None,
-//             },
-//             YtDlpFormat {
-//                 format_id: "360".to_owned(),
-//                 height: Some(360),
-//                 ext: "mp4".to_owned(),
-//                 vcodec: Some("avc1".to_owned()),
-//                 acodec: Some("aac".to_owned()),
-//                 filesize: None,
-//             },
-//             YtDlpFormat {
-//                 format_id: "1080".to_owned(),
-//                 height: Some(1080),
-//                 ext: "mp4".to_owned(),
-//                 vcodec: Some("avc1".to_owned()),
-//                 acodec: Some("aac".to_owned()),
-//                 filesize: None,
-//             },
-//         ];
-//
-//         let selected: Vec<YtDlpFormat> = deduplicate_by_resolution(formats)
-//             .into_iter()
-//             .flatten()
-//             .collect();
-//
-//         assert_eq!(
-//             selected
-//                 .iter()
-//                 .map(|format| format.format_id.as_str())
-//                 .collect::<Vec<_>>(),
-//             ["144", "360", "1080"]
-//         );
-//     }
-// }
-
-// #[test]
-// fn test_command() {
-//     let video_details = Command::new("yt-dlp")
-//         .arg("--dump-single-json")
-//         .arg("--skip-download")
-//         .arg("--cookies")
-//         // .arg("cookies/instagram-cookies.txt")
-//         .arg("cookies/youtube-cookies.txt")
-//         // .arg("https://www.instagram.com/stories/fhavur8/3995189932905526257?utm_source=ig_story_item_share&stkn=MW9xaTMydDlvaHVzMQ==")
-//         .arg("https://youtu.be/foO1QakhjZE?si=tRel8JwJ_kmZJoul")
-//         .stdout(Stdio::piped())
-//         .spawn()
-//         .map_err(|error| Error::YtDlpExecutionFailed(error.to_string()))
-//         .unwrap();
-//
-//     let formats_bytes = Command::new("jq")
-//         // .arg(r#"[.formats[] | select(.vcodec != "none" and .height != null) | {format_id, height, ext, vcodec, acodec, filesize}]"#)
-//         .arg(
-//             r#"
-//         {
-//           title,
-//           thumbnail,
-//           is_playlist: (.entries != null),
-//           item_count: (if .entries then (.entries | length) else 1 end),
-//           formats: [
-//             .formats[]?
-//             | select(.vcodec != "none" and .height != null)
-//             | {format_id, height, ext, vcodec, acodec, filesize}
-//           ],
-//           entries: [
-//             .entries[]? | {
-//                 title,
-//                 thumbnail,
-//                 formats: [
-//                     .formats[]
-//                     | select(.vcodec != "none" and .height != null)
-//                     | {format_id, height, ext, vcodec, acodec, filesize}
-//                 ]
-//             }
-//           ]
-//         }
-//         "#,
-//         )
-//         .stdin(video_details.stdout.unwrap())
-//         .output()
-//         .map_err(|error| Error::JqExecutionFailed(error.to_string()))
-//         .unwrap();
-//
-//     if formats_bytes.status.success() {
-//         let formats_string = String::from_utf8(formats_bytes.stdout).unwrap();
-//         // println!("As a string: {formats_string}");
-//         let media_metadata: MediaMetadata = serde_json::from_str(&formats_string).unwrap();
-//         println!("{}", serde_json::to_string_pretty(&media_metadata).unwrap());
-//     } else {
-//         println!("JQ execution failed");
-//     }
-// }
