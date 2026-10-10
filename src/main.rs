@@ -308,7 +308,7 @@ struct MediaInfoResponse {
 
 #[derive(Clone, Deserialize, Serialize, Debug)]
 struct MediaFormatResponse {
-    format_index: ZeroBasedIndex,
+    option_index: ZeroBasedIndex,
     height: Option<u16>,
     filesize: Option<u64>,
 }
@@ -323,7 +323,7 @@ impl From<MediaInfo> for MediaInfoResponse {
                 .into_iter()
                 .enumerate()
                 .map(|(index, format)| MediaFormatResponse {
-                    format_index: ZeroBasedIndex(index),
+                    option_index: ZeroBasedIndex(index),
                     filesize: format.filesize,
                     height: format.height,
                 })

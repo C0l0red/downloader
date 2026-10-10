@@ -140,14 +140,16 @@ fn running_server_returns_media_info_and_downloads_a_selected_file() {
         !formats.is_empty(),
         "the live URL should expose at least one format"
     );
-    assert!(formats[0]["format_index"].as_u64().is_some());
+    let option_index = formats[0]["option_index"]
+        .as_u64()
+        .expect("media format should include an option index");
 
     // Use the selected media item and format to verify the API returns the downloaded file.
 
     let download_query = url::form_urlencoded::Serializer::new(String::new())
         .append_pair("url", &url)
         .append_pair("item_index", "0")
-        .append_pair("download_option_index", "1")
+        .append_pair("download_option_index", &option_index.to_string())
         .finish();
     let download_response = server.request(&format!("GET /download?{download_query} HTTP/1.1"));
     let header_end = download_response

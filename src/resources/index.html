@@ -201,7 +201,7 @@
                 const query = new URLSearchParams({
                   url,
                   item_index: itemIndex,
-                  download_option_index: format.format_index,
+                  download_option_index: format.option_index,
                 });
                 const download = await fetch(`/download?${query}`);
                 if (!download.ok) throw new Error(await download.text());
