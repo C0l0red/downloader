@@ -72,6 +72,27 @@
       margin-top: 1rem;
     }
 
+    .media-item {
+      display: grid;
+      gap: 0.75rem;
+      padding: 1rem;
+      border: 1px solid #dce3ef;
+      border-radius: 0.75rem;
+    }
+
+    .media-item h2 {
+      margin: 0;
+      font-size: 1.15rem;
+    }
+
+    .media-item img {
+      display: block;
+      width: 100%;
+      max-height: 14rem;
+      border-radius: 0.5rem;
+      object-fit: cover;
+    }
+
     #formats button {
       display: block;
       border-color: #b8c8e4;
@@ -103,6 +124,10 @@
         background: #1e293b;
       }
 
+      .media-item {
+        border-color: #52647f;
+      }
+
       input {
         border-color: #52647f;
         background: #172033;
@@ -127,7 +152,7 @@
     <form id="formats-form">
       <label for="url">URL</label>
       <input id="url" name="url" type="url" required>
-      <button type="submit">List formats</button>
+      <button type="submit">Get media info</button>
     </form>
     <p id="message"></p>
     <div id="formats"></div>
@@ -141,50 +166,68 @@
     form.addEventListener("submit", async (event) => {
       event.preventDefault();
       formats.replaceChildren();
-      message.textContent = "Loading formats...";
+      message.textContent = "Loading media info...";
 
       try {
         const url = urlInput.value;
-        const response = await fetch(`/formats?url=${encodeURIComponent(url)}`);
+        const response = await fetch(`/media-info?url=${encodeURIComponent(url)}`);
         if (!response.ok) throw new Error(await response.text());
 
-        for (const format of await response.json()) {
-          const button = document.createElement("button");
-          button.type = "button";
-          const label = format.height === undefined && format.format_id === "best"
-            ? "download"
-            : `${format.height}p${format.filesize === undefined
-              ? ""
-              : ` - ${(format.filesize / 1_000_000).toFixed(1)} MB`}`;
-          button.textContent = label;
-          button.addEventListener("click", async () => {
-            message.textContent = "Starting download...";
-            try {
-              const download = await fetch(
-                `/download?url=${encodeURIComponent(url)}&format_id=${encodeURIComponent(format.format_id)}`
-              );
-              if (!download.ok) throw new Error(await download.text());
+        const mediaItems = await response.json();
+        for (const [itemIndex, mediaInfo] of mediaItems.entries()) {
+          const item = document.createElement("section");
+          item.className = "media-item";
 
-              const blob = await download.blob();
-              const link = document.createElement("a");
-              link.href = URL.createObjectURL(blob);
-              const disposition = download.headers.get("Content-Disposition");
-              link.download = disposition?.match(/filename="([^"]+)"/)?.[1]
-                ?? `${format.format_id}.mp4`;
-              link.click();
-              URL.revokeObjectURL(link.href);
+          const title = document.createElement("h2");
+          title.textContent = mediaInfo.title;
+          item.append(title);
 
-              formats.replaceChildren();
-              message.textContent = "Download complete";
-            } catch (error) {
-              message.textContent = `Download failed: ${error}`;
-            }
-          });
-          formats.append(button);
+          const thumbnail = document.createElement("img");
+          thumbnail.src = mediaInfo.thumbnail;
+          thumbnail.alt = `Thumbnail for ${mediaInfo.title}`;
+          item.append(thumbnail);
+
+          for (const format of mediaInfo.formats) {
+            const button = document.createElement("button");
+            button.type = "button";
+            button.textContent = format.height === undefined
+              ? "download"
+              : `${format.height}p${format.filesize == null
+                ? ""
+                : ` - ${(format.filesize / 1_000_000).toFixed(1)} MB`}`;
+            button.addEventListener("click", async () => {
+              message.textContent = "Starting download...";
+              try {
+                const query = new URLSearchParams({
+                  url,
+                  item_index: itemIndex,
+                  download_option_index: format.format_index,
+                });
+                const download = await fetch(`/download?${query}`);
+                if (!download.ok) throw new Error(await download.text());
+
+                const blob = await download.blob();
+                const link = document.createElement("a");
+                link.href = URL.createObjectURL(blob);
+                const disposition = download.headers.get("Content-Disposition");
+                link.download = disposition?.match(/filename="([^"]+)"/)?.[1]
+                  ?? "download";
+                link.click();
+                URL.revokeObjectURL(link.href);
+
+                message.textContent = "Download complete";
+              } catch (error) {
+                message.textContent = `Download failed: ${error}`;
+              }
+            });
+            item.append(button);
+          }
+
+          formats.append(item);
         }
         message.textContent = "Choose a format:";
       } catch (error) {
-        message.textContent = `Could not list formats: ${error}`;
+        message.textContent = `Could not get media info: ${error}`;
       }
     });
   </script>
