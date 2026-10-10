@@ -89,7 +89,7 @@ fn running_server_serves_ui_through_http() {
     }
     let mut stream = stream.expect("live API should accept connections");
     stream
-        .write_all(b"GET /ui HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+        .write_all(b"GET /ui?url=https%3A%2F%2Fexample.com%2Fvideo HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
         .unwrap();
     let mut response = String::new();
     stream.read_to_string(&mut response).unwrap();
@@ -97,6 +97,7 @@ fn running_server_serves_ui_through_http() {
     assert!(response.starts_with("HTTP/1.1 200 OK"));
     assert!(response.contains("<!doctype html>") || response.contains("<!DOCTYPE html>"));
     assert!(response.contains("<h1>Downloader</h1>"));
+    assert!(response.contains("new URLSearchParams(window.location.search)"));
 }
 
 #[test]

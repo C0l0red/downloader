@@ -163,13 +163,11 @@
     const formats = document.getElementById("formats");
     const message = document.getElementById("message");
 
-    form.addEventListener("submit", async (event) => {
-      event.preventDefault();
+    async function loadMediaInfo(url) {
       formats.replaceChildren();
       message.textContent = "Loading media info...";
 
       try {
-        const url = urlInput.value;
         const response = await fetch(`/media-info?url=${encodeURIComponent(url)}`);
         if (!response.ok) throw new Error(await response.text());
 
@@ -229,7 +227,18 @@
       } catch (error) {
         message.textContent = `Could not get media info: ${error}`;
       }
+    }
+
+    form.addEventListener("submit", async (event) => {
+      event.preventDefault();
+      await loadMediaInfo(urlInput.value);
     });
+
+    const initialUrl = new URLSearchParams(window.location.search).get("url");
+    if (initialUrl) {
+      urlInput.value = initialUrl;
+      loadMediaInfo(initialUrl);
+    }
   </script>
 </body>
 </html>
