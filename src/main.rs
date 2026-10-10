@@ -9,6 +9,7 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use std::array::IntoIter;
 use std::fmt::Display;
+use std::ops::Deref;
 use std::path::PathBuf;
 use std::{
     collections::HashMap,
@@ -23,6 +24,44 @@ const DEFAULT_ADDRESS: &str = "0.0.0.0:3424";
 type MediaItems = Vec<MediaInfo>;
 type MediaItemsResponse = Vec<MediaInfoResponse>;
 type MediaCache = HashMap<String, MediaItems>;
+
+/// A newtype for a zero-based index, to enforce explicitness for where in the code an index is zero-based
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct ZeroBasedIndex(usize);
+
+/// A newtype for a one-based index, to enforce explicitness for where in the code an index is one-based
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct OneBasedIndex(usize);
+
+impl Deref for ZeroBasedIndex {
+    type Target = usize;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl Deref for OneBasedIndex {
+    type Target = usize;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+/// Converting from a one-based index to a zero-based index, subtracting by 1 but checking for a possible underflow
+impl From<OneBasedIndex> for ZeroBasedIndex {
+    fn from(value: OneBasedIndex) -> Self {
+        Self(value.0.checked_sub(1).unwrap_or(0))
+    }
+}
+
+/// Converting from a zero-based index to a one-based index, adding by 1 (possible overflow currently ignored)
+impl From<ZeroBasedIndex> for OneBasedIndex {
+    fn from(value: ZeroBasedIndex) -> Self {
+        Self(value.0 + 1)
+    }
+}
 
 #[tokio::main]
 async fn main() -> Result<(), Error> {
@@ -223,6 +262,7 @@ impl Display for TempDownloadedFile {
 struct YtDlpMediaMetadata {
     title: String,
     thumbnail: Option<String>,
+    #[serde(default)]
     formats: Vec<YtDlpFormat>,
     #[serde(default)]
     entries: Vec<YtDlpMediaEntryMetadata>,
@@ -268,7 +308,7 @@ struct MediaInfoResponse {
 
 #[derive(Clone, Deserialize, Serialize, Debug)]
 struct MediaFormatResponse {
-    format_index: usize,
+    format_index: ZeroBasedIndex,
     height: Option<u16>,
     filesize: Option<u64>,
 }
@@ -283,7 +323,7 @@ impl From<MediaInfo> for MediaInfoResponse {
                 .into_iter()
                 .enumerate()
                 .map(|(index, format)| MediaFormatResponse {
-                    format_index: index,
+                    format_index: ZeroBasedIndex(index),
                     filesize: format.filesize,
                     height: format.height,
                 })
@@ -580,18 +620,35 @@ impl FormatPredicate for IsVideoFormat {
     }
 }
 
+/// Predicate for finding formats that contain both video and audio
+struct HasVideoAndAudio;
+
+impl FormatPredicate for HasVideoAndAudio {
+    fn matches(&self, format: &YtDlpFormat) -> bool {
+        // Confirm that acodec and vcodec are not equal to the string value "none"
+        !format
+            .vcodec
+            .as_ref()
+            .is_some_and(|vcodec| vcodec == "none")
+            && !format
+                .acodec
+                .as_ref()
+                .is_some_and(|acodec| acodec == "none")
+    }
+}
+
 #[derive(Deserialize, Debug)]
 struct GetMediaInfoRequest {
     url: String,
 }
 
 #[derive(Deserialize, Debug)]
-struct DownloadParams {
+struct DownloadParamsRequest {
     url: String,
-    download_option_index: usize,
+    download_option_index: ZeroBasedIndex,
     #[serde(default)]
     keep_on_server: bool,
-    item_index: usize,
+    item_index: ZeroBasedIndex,
 }
 
 // yt-dlp wrapper
@@ -599,8 +656,9 @@ struct DownloadParams {
 struct YtDlp {
     url: String,
     format_id: Option<String>,
+    item_index: Option<OneBasedIndex>,
     cookies_path: Option<PathBuf>,
-    output_path: PathBuf,
+    output_path: Option<PathBuf>,
     merge_mp4: bool,
     default_to_best_audio: bool,
 }
@@ -609,6 +667,7 @@ struct YtDlp {
 struct YtDlpBuilder {
     url: Option<String>,
     format_id: Option<String>,
+    item_index: Option<OneBasedIndex>,
     cookies_path: Option<PathBuf>,
     output_path: Option<PathBuf>,
     merge_mp4: bool,
@@ -627,6 +686,11 @@ impl YtDlpBuilder {
 
     fn format_id(mut self, format_id: impl Into<String>) -> Self {
         self.format_id = Some(format_id.into());
+        self
+    }
+
+    fn item_index(mut self, item_index: OneBasedIndex) -> Self {
+        self.item_index = Some(item_index);
         self
     }
 
@@ -656,12 +720,9 @@ impl YtDlpBuilder {
                 Error::Internal("Building the yt-dlp request failed: URL is missing".to_owned())
             })?,
             format_id: self.format_id,
+            item_index: self.item_index,
             cookies_path: self.cookies_path,
-            output_path: self.output_path.ok_or_else(|| {
-                Error::Internal(
-                    "Building the yt-dlp request failed: output path is missing".to_owned(),
-                )
-            })?,
+            output_path: self.output_path,
             merge_mp4: self.merge_mp4,
             default_to_best_audio: self.default_to_best_audio,
         })
@@ -669,15 +730,19 @@ impl YtDlpBuilder {
 }
 
 impl YtDlp {
-    fn get_metadata(&self) -> Result<serde_json::Value, Error> {
+    fn get_metadata(&self) -> Result<YtDlpMediaMetadata, Error> {
         let mut command = Command::new("yt-dlp");
         command.args(["--dump-single-json", "--skip-download"]);
         self.add_cookies(&mut command);
         command.arg(&self.url);
 
         let output = Self::execute(&mut command)?;
-        serde_json::from_slice(&output.stdout)
-            .map_err(|error| Error::FormatDeserializationFailed(error.to_string()))
+        serde_json::from_slice(&output.stdout).map_err(|error| {
+            Error::FormatDeserializationFailed(format!(
+                "Failed to deserialize yt-dlp metadata: {}",
+                error.to_string()
+            ))
+        })
     }
 
     fn download_media(&self) -> Result<TempDownloadedFile, Error> {
@@ -695,13 +760,28 @@ impl YtDlp {
             .unwrap_or_else(|| "b".to_owned());
 
         let mut command = Command::new("yt-dlp");
+        // Add args to choose format
         command.args(["-f", &format]);
         if self.merge_mp4 {
             command.args(["--merge-output-format", "mp4"]);
         }
+        // Add args to print the filename after download
         command.args(["--print", "after_move:filename"]);
+
+        // Add args to include cookies if a path is set
         self.add_cookies(&mut command);
-        command.args(["-o", self.output_path.to_string_lossy().as_ref(), &self.url]);
+
+        // Add playlist item index if set
+        self.add_item_index(&mut command);
+
+        // Add args to output file path, fail if missing
+        let Some(output_path) = &self.output_path else {
+            return Err(Error::Internal(
+                "Output path missing for download".to_string(),
+            ));
+        };
+        command.args(["-o", output_path.to_string_lossy().as_ref(), &self.url]);
+
         let output = Self::execute(&mut command)?;
 
         if output.status.success() {
@@ -716,6 +796,12 @@ impl YtDlp {
     fn add_cookies(&self, command: &mut Command) {
         if let Some(path) = &self.cookies_path {
             command.args(["--cookies", path.to_string_lossy().as_ref()]);
+        }
+    }
+
+    fn add_item_index(&self, command: &mut Command) {
+        if let Some(index) = &self.item_index {
+            command.args(["--playlist-items", &index.to_string()]);
         }
     }
 
@@ -735,32 +821,31 @@ impl YtDlp {
     }
 }
 
+#[derive(Debug)]
+struct ProviderDownloadSpecs {
+    url: String,
+    format_id: String,
+    item_index: OneBasedIndex,
+}
+
 // Content providers
 
 trait ContentProvider {
     fn get_media_items(&self, url: &str) -> Result<MediaItems, Error> {
-        let metadata_json = YtDlpBuilder::new().url(url).build()?.get_metadata()?;
-        let media_metadata: YtDlpMediaMetadata =
-            serde_json::from_value(metadata_json).map_err(|error| {
-                Error::FormatDeserializationFailed(format!(
-                    "Failed to deserialize metadata: {}",
-                    error
-                ))
-            })?;
-
-        Ok(media_metadata.try_into()?)
+        let yt_dlp_media_metadata = YtDlpBuilder::new().url(url).build()?.get_metadata()?;
+        Ok(yt_dlp_media_metadata.try_into()?)
     }
 
     fn download(
         &self,
-        url: String,
-        format_id: String,
         config: &Config,
+        download_specs: ProviderDownloadSpecs,
     ) -> Result<TempDownloadedFile, Error> {
         YtDlpBuilder::new()
-            .url(&url)
+            .url(&download_specs.url)
             .output_path(get_download_file_path(config))
-            .format_id(format_id)
+            .item_index(download_specs.item_index)
+            .format_id(download_specs.format_id)
             .build()?
             .download_media()
     }
@@ -768,7 +853,7 @@ trait ContentProvider {
     fn get_format_for_download(
         &self,
         media_cache: &RwLock<MediaCache>,
-        download_params: &DownloadParams,
+        download_params: &DownloadParamsRequest,
     ) -> Result<MediaFormat, Error> {
         // TODO: try to achieve this without cloning
         let media_items = media_cache
@@ -780,17 +865,18 @@ trait ContentProvider {
 
         let media_info =
             media_items
-                .get(download_params.item_index as usize)
+                .get(*download_params.item_index)
                 .ok_or(Error::InvalidInput(format!(
                     "Item index {} not found",
-                    download_params.item_index
+                    *download_params.item_index
                 )))?;
+
         let format = media_info
             .formats
-            .get(download_params.download_option_index as usize)
+            .get(*download_params.download_option_index)
             .ok_or(Error::InvalidInput(format!(
                 "Download option index {} not found",
-                download_params.download_option_index
+                *download_params.download_option_index
             )))?;
 
         Ok(format.clone())
@@ -801,42 +887,35 @@ struct YouTubeProvider {
     config: Config,
 }
 struct FacebookProvider;
-struct InstagramProvider;
+struct InstagramProvider {
+    config: Config,
+}
 struct XProvider;
 struct TikTokProvider;
 
 impl ContentProvider for YouTubeProvider {
     fn get_media_items(&self, _url: &str) -> Result<MediaItems, Error> {
-        let metadata_json = YtDlpBuilder::new()
+        let mut yt_dlp_media_metadata = YtDlpBuilder::new()
             .url(_url)
             .cookies_path(&self.config.youtube_cookies_path)
-            .output_path(get_download_file_path(&self.config))
             .build()?
             .get_metadata()?;
-        let mut media_metadata: YtDlpMediaMetadata = serde_json::from_value(metadata_json)
-            .map_err(|error| {
-                Error::FormatDeserializationFailed(format!(
-                    "Failed to deserialize metadata: {}",
-                    error
-                ))
-            })?;
 
         // Filter out non-video formats and formats incompatible with iPhone
         let predicates: &[&dyn FormatPredicate] = &[&IsVideoFormat, &IsIphoneCompatible];
-        filter_media_metadata_formats(&mut media_metadata, predicates)?;
+        filter_media_metadata_formats(&mut yt_dlp_media_metadata, predicates)?;
 
-        Ok(media_metadata.try_into()?)
+        Ok(yt_dlp_media_metadata.try_into()?)
     }
 
     fn download(
         &self,
-        url: String,
-        format_id: String,
         config: &Config,
+        download_specs: ProviderDownloadSpecs,
     ) -> Result<TempDownloadedFile, Error> {
         YtDlpBuilder::new()
-            .url(url)
-            .format_id(format_id)
+            .url(download_specs.url)
+            .format_id(download_specs.format_id)
             .default_to_best_audio()
             .cookies_path(&config.youtube_cookies_path)
             .output_path(get_download_file_path(&config))
@@ -848,15 +927,28 @@ impl ContentProvider for YouTubeProvider {
 
 impl ContentProvider for FacebookProvider {}
 impl ContentProvider for InstagramProvider {
+    fn get_media_items(&self, url: &str) -> Result<MediaItems, Error> {
+        let mut yt_dlp_media_metadata = YtDlpBuilder::new()
+            .url(url)
+            .cookies_path(&self.config.instagram_cookies_path)
+            .build()?
+            .get_metadata()?;
+
+        // Retain only formats that contain both video and audio
+        let predicates: &[&dyn FormatPredicate] = &[&HasVideoAndAudio];
+        filter_media_metadata_formats(&mut yt_dlp_media_metadata, predicates)?;
+
+        Ok(yt_dlp_media_metadata.try_into()?)
+    }
     fn download(
         &self,
-        url: String,
-        format_id: String,
         config: &Config,
+        download_specs: ProviderDownloadSpecs,
     ) -> Result<TempDownloadedFile, Error> {
         YtDlpBuilder::new()
-            .url(url)
-            .format_id(format_id)
+            .url(download_specs.url)
+            .format_id(download_specs.format_id)
+            .item_index(download_specs.item_index)
             .cookies_path(&config.instagram_cookies_path)
             .output_path(get_download_file_path(&config))
             .build()?
@@ -879,24 +971,30 @@ async fn run_cli(state: &AppState) -> Result<(), Error> {
             let media_info = media_items.get(0).ok_or(Error::Internal(
                 "Failed to get first media item for URL".to_string(),
             ))?;
-            (0, media_info)
+            (OneBasedIndex(1), media_info)
         }
         _ => {
             for (index, media_info) in media_items.iter().enumerate() {
-                println!("{} -> Thumbnail ({})", index + 1, media_info.thumbnail);
+                let index = ZeroBasedIndex(index);
+                println!(
+                    "{} -> Thumbnail ({})",
+                    OneBasedIndex::from(index).to_string(),
+                    media_info.thumbnail
+                );
             }
             let choice = prompt("Select an item index from the list of items in the URL: ")?;
-            let index = parse_choice_to_usize(&choice)?;
-            let media_info = select_index(&media_items, index)?;
+            let index = parse_choice_to_index(&choice)?;
+            let media_info = select_index(&media_items, *index)?;
 
             (index, media_info)
         }
     };
 
     for (index, format) in media_info.formats.iter().enumerate() {
+        let index = ZeroBasedIndex(index);
         println!(
             "{}. {}p - {}",
-            index + 1,
+            OneBasedIndex::from(index).to_string(),
             if let Some(height) = format.height {
                 if height == 0 {
                     "best".to_owned()
@@ -914,12 +1012,12 @@ async fn run_cli(state: &AppState) -> Result<(), Error> {
     }
 
     let choice = prompt("Select format: ")?;
-    let download_option_index = parse_choice_to_usize(&choice)?;
+    let download_option_index = parse_choice_to_index(&choice)?;
 
-    let download_params = DownloadParams {
+    let download_params = DownloadParamsRequest {
         url: url.clone(),
-        download_option_index,
-        item_index,
+        download_option_index: download_option_index.into(),
+        item_index: item_index.into(),
         keep_on_server: false,
     };
     download_video(download_params, state).await?;
@@ -941,9 +1039,10 @@ fn select_index<T>(slice: &[T], index: usize) -> Result<&T, Error> {
         )))
 }
 
-fn parse_choice_to_usize(choice: &str) -> Result<usize, Error> {
+fn parse_choice_to_index(choice: &str) -> Result<OneBasedIndex, Error> {
     choice
-        .parse()
+        .parse::<usize>()
+        .map(OneBasedIndex)
         .map_err(|_| Error::InvalidInput(format!("Invalid input: {choice} is not a number")))
 }
 
@@ -987,13 +1086,13 @@ async fn get_media_info_handler(
 
 async fn download_handler(
     State(state): State<Arc<AppState>>,
-    Query(download_params): Query<DownloadParams>,
+    Query(download_params): Query<DownloadParamsRequest>,
 ) -> Result<Response<Body>, Error> {
     println!(
         "Received download request for URL: {} for item index: {} and download option index: {} (keep_on_server: {})",
         download_params.url,
-        download_params.item_index,
-        download_params.download_option_index,
+        *download_params.item_index,
+        *download_params.download_option_index,
         download_params.keep_on_server
     );
     let keep_on_server = download_params.keep_on_server;
@@ -1094,7 +1193,9 @@ fn downloader_for_url(url: &str, config: &Config) -> Result<Box<dyn ContentProvi
             config: config.clone(),
         })),
         Platform::Facebook => Ok(Box::new(FacebookProvider)),
-        Platform::Instagram => Ok(Box::new(InstagramProvider)),
+        Platform::Instagram => Ok(Box::new(InstagramProvider {
+            config: config.clone(),
+        })),
         Platform::X => Ok(Box::new(XProvider)),
         Platform::TikTok => Ok(Box::new(TikTokProvider)),
         Platform::Unsupported(host) => Err(Error::UnsupportedPlatform(host)),
@@ -1106,13 +1207,18 @@ async fn get_media_items(url: &str, config: &Config) -> Result<MediaItems, Error
 }
 
 async fn download_video(
-    download_params: DownloadParams,
+    download_params: DownloadParamsRequest,
     state: &AppState,
 ) -> Result<TempDownloadedFile, Error> {
     let provider = downloader_for_url(&download_params.url, &state.config)?;
     let format = provider.get_format_for_download(&state.media_cache, &download_params)?;
+    let download_specs = ProviderDownloadSpecs {
+        url: download_params.url.clone(),
+        format_id: format.format_id.clone(),
+        item_index: download_params.item_index.into(),
+    };
 
-    provider.download(download_params.url, format.format_id, &state.config)
+    provider.download(&state.config, download_specs)
 }
 
 #[cfg(test)]
@@ -1372,8 +1478,8 @@ mod unit_tests {
         assert_eq!(*select_index(&[10, 20], 2).unwrap(), 20);
         assert!(select_index(&[10], 0).is_err());
         assert!(select_index(&[10], 2).is_err());
-        assert_eq!(parse_choice_to_usize("12").unwrap(), 12);
-        assert!(parse_choice_to_usize("x").is_err());
+        assert_eq!(*parse_choice_to_index("12").unwrap(), 12);
+        assert!(parse_choice_to_index("x").is_err());
     }
 
     #[test]
@@ -1394,10 +1500,10 @@ mod unit_tests {
                 }],
             }],
         );
-        let params = DownloadParams {
+        let params = DownloadParamsRequest {
             url: "url".into(),
-            download_option_index: 0,
-            item_index: 0,
+            download_option_index: ZeroBasedIndex(0),
+            item_index: ZeroBasedIndex(0),
             keep_on_server: false,
         };
         assert_eq!(
@@ -1411,10 +1517,10 @@ mod unit_tests {
             FacebookProvider
                 .get_format_for_download(
                     &state.media_cache,
-                    &DownloadParams {
+                    &DownloadParamsRequest {
                         url: "url".into(),
-                        download_option_index: 0,
-                        item_index: 1,
+                        download_option_index: ZeroBasedIndex(0),
+                        item_index: ZeroBasedIndex(1),
                         keep_on_server: false
                     }
                 )
@@ -1424,10 +1530,10 @@ mod unit_tests {
             FacebookProvider
                 .get_format_for_download(
                     &state.media_cache,
-                    &DownloadParams {
+                    &DownloadParamsRequest {
                         url: "url".into(),
-                        download_option_index: 1,
-                        item_index: 0,
+                        download_option_index: ZeroBasedIndex(1),
+                        item_index: ZeroBasedIndex(0),
                         keep_on_server: false
                     }
                 )
@@ -1449,7 +1555,7 @@ mod unit_tests {
     #[test]
     fn request_structs_deserialize_defaults_and_config_paths_are_used() {
         let request: GetMediaInfoRequest = serde_json::from_str(r#"{"url":"u"}"#).unwrap();
-        let params: DownloadParams =
+        let params: DownloadParamsRequest =
             serde_json::from_str(r#"{"url":"u","download_option_index":1,"item_index":2}"#)
                 .unwrap();
         assert_eq!(request.url, "u");
@@ -1470,7 +1576,9 @@ mod unit_tests {
         let youtube = YouTubeProvider {
             config: configuration.clone(),
         };
-        let instagram = InstagramProvider;
+        let instagram = InstagramProvider {
+            config: configuration.clone(),
+        };
         let facebook = FacebookProvider;
         let x = XProvider;
         let tiktok = TikTokProvider;
