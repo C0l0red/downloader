@@ -1,9 +1,9 @@
 use std::io::{Read, Write};
 use std::net::TcpStream;
-use std::process::{Child, Command, Stdio};
-use std::{panic, thread};
 use std::panic::catch_unwind;
+use std::process::{Child, Command, Stdio};
 use std::time::Duration;
+use std::{panic, thread};
 
 fn test_url() -> String {
     // The live tests use a real URL so they exercise yt-dlp and the configured cookies.
@@ -73,7 +73,6 @@ impl Drop for RunningServer {
         }
     }
 }
-
 
 #[test]
 fn running_server_serves_ui_through_http() {
@@ -174,13 +173,13 @@ fn running_server_returns_media_info_and_downloads_a_selected_file() {
 #[test]
 fn running_server_kills_connection_upon_panic() {
     let result = catch_unwind(|| {
-        RunningServer::start("127.0.0.1:39092");
+        RunningServer::start("127.0.0.1:39093");
         panic!("child process has panicked");
     });
     assert!(result.is_err(), "child process should have panicked");
 
     let output = Command::new("lsof")
-        .args(["-i", ":39092"])
+        .args(["-i", ":39093"])
         .output()
         .expect("lsof should have exited");
 

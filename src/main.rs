@@ -1456,7 +1456,7 @@ mod unit_tests {
         assert!(!params.keep_on_server);
         assert_eq!(
             get_download_file_path(&config()),
-            PathBuf::from("downloads/%(id)s.%(ext)s")
+            PathBuf::from("downloads/%(title)s.%(ext)s")
         );
     }
 
