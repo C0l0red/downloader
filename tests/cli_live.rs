@@ -22,7 +22,12 @@ fn running_cli_reports_invalid_url_from_stdin() {
         .spawn()
         .expect("CLI should start");
 
-    child.stdin.take().unwrap().write_all(b"not a url\n").unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(b"not a url\n")
+        .unwrap();
     let output = child.wait_with_output().expect("CLI should finish");
 
     assert!(!output.status.success());
@@ -54,7 +59,11 @@ fn running_cli_fetches_media_info_and_downloads_a_selected_file() {
         .unwrap();
     let output = child.wait_with_output().expect("CLI should finish");
 
-    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("URL:"));
     // The CLI displays media information as selectable formats before downloading.
