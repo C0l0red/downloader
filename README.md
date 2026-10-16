@@ -60,7 +60,8 @@ Return the media info and available download options with `GET /media-info`:
 /media-info?url=https%3A%2F%2Fwww.youtube.com%2Fwatch%3Fv%3D...
 ```
 
-Download a selected option and item (if the link leads to a playlist) with `GET /download`.  
+Download a selected option and item (some links can lead to multiple files, such as a YouTube playlist. If only a single
+media file exists, the item index is 0) with `GET /download`.  
 The required query parameters are `url`, `download_option_index`, and `item_index`; both
 indexes are zero-based. Set the optional `keep_on_server` parameter to `true` to keep the
 downloaded file on the server instead of returning it:
