@@ -1,5 +1,5 @@
 # Siri Shortcut
-Siri Shortcuts are an easy way to automate tasks on your Apple devices, I'm a fan, so
+Siri Shortcuts are an easy way to automate tasks on your Apple devices; I'm a fan, so
 this is my preferred way to download media using this project.
 
 Once you add this shortcut, you can add it to your share sheet. Then it is accessible
