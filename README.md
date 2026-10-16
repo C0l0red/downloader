@@ -1,4 +1,4 @@
-# downloader
+# Media Downloader
 This is a lightweight application that helps download videos
 from websites like YouTube, Instagram, and more.  
 I'm working on it for the sole purpose of having a personal downloader 
@@ -7,7 +7,7 @@ without having to go through the ad-ridden solutions available online.
 It is still in development at the foundational level.
 Feel free to clone, fork or make contributions.
 
-To use, it currently works by running the server locally, and then making it accessible
+To use, it currently works by running the server locally and then making it accessible
 from any device on your local network, including your phones, tablets, or other devices.  
 You would need to find out your machine's local hostname, which is static and stays the same 
 on any network it's connected to. It looks something like `my-macbook.local` or `my-pc.local`.
