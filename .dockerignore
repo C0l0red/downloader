@@ -1,0 +1,9 @@
+.git
+.idea
+.env
+target
+downloads
+cookies
+Dockerfile
+.dockerignore
+README.md

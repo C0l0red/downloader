@@ -1,0 +1,11 @@
+services:
+  downloader:
+    build:
+      context: .
+    image: downloader:local
+    ports:
+      - "3424:3424"
+    user: "${UID:-1000}:${GID:-1000}"
+    volumes:
+      - ./cookies:/app/cookies:rw
+      - ./downloads:/app/downloads:rw
