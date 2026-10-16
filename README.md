@@ -34,11 +34,11 @@ cp .env.example .env
 cargo test
 ```
 
-The `.env` file is ignored by Git so these values stay local.
-Set `YOUTUBE_COOKIES_FILE` and `INSTAGRAM_COOKIES_FILE` in `.env` to the
-cookie-file paths used by the corresponding downloaders. Set
-`DOWNLOADS_DIRECTORY` to change where downloaded files are stored; it defaults
-to the project's `downloads` directory.
+The `.env` file is ignored by Git so these values stay local.  
+Set `YOUTUBE_COOKIES_FILE` and `INSTAGRAM_COOKIES_FILE` in `.env` to your preferred
+cookie file paths used by the corresponding downloaders in Netscape HTTP cookie file format.  
+Set `DOWNLOADS_DIRECTORY` to change where downloaded files are stored; it defaults
+to the project's `downloads` directory if you don't create one.
 
 To start the Axum JSON API, use `server` and optionally provide a bind address:
 
@@ -54,24 +54,27 @@ start a download by selecting a format:
 http://localhost:3424/ui
 ```
 
-List available formats with `GET /formats`:
+Return the media info and available download options with `GET /media-info`:
 
 ```text
-/formats?url=https%3A%2F%2Fwww.youtube.com%2Fwatch%3Fv%3D...
+/media-info?url=https%3A%2F%2Fwww.youtube.com%2Fwatch%3Fv%3D...
 ```
 
-Download a format with `GET /download`:
+Download a selected option and item (if the link leads to a playlist) with `GET /download`.  
+The required query parameters are `url`, `download_option_index`, and `item_index`; both
+indexes are zero-based. Set the optional `keep_on_server` parameter to `true` to keep the
+downloaded file on the server instead of returning it:
 
 ```text
-/download?url=https%3A%2F%2Fwww.youtube.com%2Fwatch%3Fv%3D...&format_id=401
+/download?url=https%3A%2F%2Fwww.youtube.com%2Fwatch%3Fv%3D...&download_option_index=0&item_index=0&keep_on_server=false
 ```
 
-Downloads are returned to the client by default and removed from the server
-after the response is opened. Add `keep_on_server=true` to keep the downloaded
-file in the server's `downloads` directory instead:
+With `keep_on_server=false` (the default), the download is returned to the client
+and removed from the server afterward. With `keep_on_server=true`, the endpoint
+returns `204 No Content` and keeps the file in the server's `downloads` directory:
 
 ```text
-/download?url=https%3A%2F%2Fwww.youtube.com%2Fwatch%3Fv%3D...&format_id=401&keep_on_server=true
+/download?url=https%3A%2F%2Fwww.youtube.com%2Fwatch%3Fv%3D...&download_option_index=0&item_index=0&keep_on_server=true
 ```
 
 ## Docker
